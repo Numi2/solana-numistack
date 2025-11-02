@@ -1,0 +1,27 @@
+
+[package]
+name = "jito-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "jito_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jito-bundle"
+path = "src/bin/jito_bundle.rs"
+
+[build-dependencies]
+tonic-build = "0.12.3"
+prost-build = "0.13.3"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "time"] }
+tonic = { version = "0.12.3", features = ["tls"] }
+prost = "0.13.3"
+prost-types = "0.13.3"
+clap = { version = "4.5.18", features = ["derive"] }
+base64 = "0.22.1"
+time = { workspace = true }

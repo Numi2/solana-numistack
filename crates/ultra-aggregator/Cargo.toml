@@ -1,0 +1,23 @@
+[package]
+name = "ultra-aggregator"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+kafka = ["rdkafka"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+faststreams = { path = "../faststreams" }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = "0.23.0"
+metrics-exporter-prometheus = "0.15.3"
+
+# optional sink
+rdkafka = { version = "0.36.2", optional = true, default-features = false, features = ["cmake-build"] }

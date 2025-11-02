@@ -1,0 +1,17 @@
+
+[package]
+name = "ys-consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "net", "signal"] }
+futures = "0.3.30"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+faststreams = { path = "../faststreams" }
+bincode = { workspace = true }
+yellowstone-grpc-client = "10.1.1"
+yellowstone-grpc-proto = "10.1.1"

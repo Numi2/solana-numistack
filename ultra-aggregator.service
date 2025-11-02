@@ -1,0 +1,15 @@
+
+[Unit]
+Description=Ultra Geyser Aggregator
+After=network.target
+
+[Service]
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/ultra-aggregator /etc/ultra/aggregator.json
+Restart=always
+RestartSec=2
+User=sol
+Group=sol
+
+[Install]
+WantedBy=multi-user.target

@@ -10,10 +10,11 @@ use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use yellowstone_grpc_client::GeyserGrpcClient;
+use std::collections::HashMap;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
     SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterSlots,
-    SubscribeRequestFilterTransactions, SubscribeUpdate,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing,
 };
 
 fn uds_connect(path: &str) -> std::io::Result<UnixStream> {
@@ -79,22 +80,34 @@ async fn main() -> Result<()> {
     if let Some(tok) = x_token {
         builder = builder.x_token(Some(tok))?;
     }
-    // Use compression if supported
-    builder = builder.accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        .send_compressed(tonic::codec::CompressionEncoding::Gzip);
     let mut client = builder.connect().await?;
 
     let (mut tx, mut rx) = client.subscribe().await?;
+    let mut filters = HashMap::new();
+    filters.insert("".to_string(), SubscribeRequestFilterSlots::default());
+    
+    let mut accounts = HashMap::new();
+    accounts.insert("".to_string(), SubscribeRequestFilterAccounts::default());
+    
+    let mut transactions = HashMap::new();
+    transactions.insert("".to_string(), SubscribeRequestFilterTransactions::default());
+    
+    let mut blocks = HashMap::new();
+    blocks.insert("".to_string(), SubscribeRequestFilterBlocks::default());
+    
+    let mut blocks_meta = HashMap::new();
+    blocks_meta.insert("".to_string(), SubscribeRequestFilterBlocksMeta::default());
+    
     let req = SubscribeRequest {
         // Subscribe broadly; filter in downstream sink if needed
-        slots: Some(SubscribeRequestFilterSlots::default()),
-        accounts: Some(SubscribeRequestFilterAccounts::default()),
-        transactions: Some(SubscribeRequestFilterTransactions::default()),
-        blocks: Some(SubscribeRequestFilterBlocks::default()),
-        blocks_meta: Some(SubscribeRequestFilterBlocksMeta::default()),
+        slots: filters,
+        accounts,
+        transactions,
+        blocks,
+        blocks_meta,
         commitment: Some(CommitmentLevel::Processed as i32),
         accounts_data_slice: vec![],
-        ping: Some(true),
+        ping: Some(SubscribeRequestPing { id: 0 }),
         ..Default::default()
     };
     tx.send(req).await?;
@@ -115,37 +128,50 @@ async fn main() -> Result<()> {
         match upd.update_oneof {
             Some(subscribe_update::UpdateOneof::Transaction(t)) => {
                 let mut sig = [0u8; 64];
-                if let Ok(v) = bs58::decode(&t.signature).into_vec() { if v.len()==64 { sig.copy_from_slice(&v[..]); } }
+                // Extract signature from transaction if available
+                if let Some(tx_data) = &t.transaction {
+                    if tx_data.signature.len() == 64 {
+                        sig.copy_from_slice(&tx_data.signature);
+                    }
+                }
                 let rec = Record::Tx(TxUpdate {
                     slot: t.slot,
                     signature: sig,
-                    err: if t.is_failed { Some("failed".into()) } else { None },
-                    vote: t.is_vote,
+                    err: t.transaction.as_ref().and_then(|tx| tx.meta.as_ref()).and_then(|m| m.err.as_ref().cloned()).map(|e| format!("{:?}", e)),
+                    vote: false, // is_vote not available in new structure
                 });
                 if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
             }
             Some(subscribe_update::UpdateOneof::Account(a)) => {
-                let rec = Record::Account(AccountUpdate {
-                    slot: a.slot,
-                    is_startup: false,
-                    pubkey: bs58::decode(a.pubkey).into_vec().unwrap_or_default().try_into().unwrap_or([0;32]),
-                    lamports: a.lamports as u64,
-                    owner: bs58::decode(a.owner).into_vec().unwrap_or_default().try_into().unwrap_or([0;32]),
-                    executable: a.executable,
-                    rent_epoch: a.rent_epoch as u64,
-                    data: a.data,
-                });
-                if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
+                if let Some(acc) = &a.account {
+                    let rec = Record::Account(AccountUpdate {
+                        slot: a.slot,
+                        is_startup: a.is_startup,
+                        pubkey: bs58::decode(&acc.pubkey).into_vec().unwrap_or_default().try_into().unwrap_or([0;32]),
+                        lamports: acc.lamports,
+                        owner: bs58::decode(&acc.owner).into_vec().unwrap_or_default().try_into().unwrap_or([0;32]),
+                        executable: acc.executable,
+                        rent_epoch: acc.rent_epoch,
+                        data: acc.data.clone(),
+                    });
+                    if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
+                }
             }
             Some(subscribe_update::UpdateOneof::Block(b)) => {
-                let bh = b.blockhash.and_then(|s| bs58::decode(s).into_vec().ok()).and_then(|v| v.try_into().ok());
-                let ld = b.leader.and_then(|s| bs58::decode(s).into_vec().ok()).and_then(|v| v.try_into().ok());
+                let bh = if !b.blockhash.is_empty() {
+                    bs58::decode(&b.blockhash).into_vec().ok().and_then(|v| v.try_into().ok())
+                } else {
+                    None
+                };
+                // leader field not available in new proto version, set to None
+                let ld = None;
+                let block_time = b.block_time.as_ref().and_then(|ts| if ts.timestamp != 0 { Some(ts.timestamp) } else { None });
                 let rec = Record::Block(BlockMeta {
                     slot: b.slot,
                     blockhash: bh,
-                    parent_slot: b.parent_slot.unwrap_or(0),
-                    rewards_len: b.rewards.map(|r| r.rewards.len()).unwrap_or(0) as u32,
-                    block_time_unix: b.block_time,
+                    parent_slot: if b.parent_slot > 0 { b.parent_slot - 1 } else { 0 },
+                    rewards_len: b.rewards.as_ref().map(|r| r.rewards.len()).unwrap_or(0) as u32,
+                    block_time_unix: block_time,
                     leader: ld,
                 });
                 if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }

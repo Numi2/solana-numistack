@@ -3,7 +3,6 @@ use crate::Config;
 use crossbeam_channel::Receiver;
 use faststreams::write_all_vectored;
 use metrics::{counter, histogram};
-use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;

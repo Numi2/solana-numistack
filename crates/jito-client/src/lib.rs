@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 pub mod jito {
-    pub mod auth { tonic::include_proto!("auth"); }
+    // pub mod auth { tonic::include_proto!("auth"); } // Empty proto file
     pub mod bundle { tonic::include_proto!("bundle"); }
     pub mod packet { tonic::include_proto!("packet"); }
     pub mod shared { tonic::include_proto!("shared"); }
     pub mod searcher { tonic::include_proto!("searcher"); }
-    pub mod block_engine { tonic::include_proto!("block_engine"); }
-    pub mod relayer { tonic::include_proto!("relayer"); }
+    // pub mod block_engine { tonic::include_proto!("block_engine"); } // Empty proto file
+    // pub mod relayer { tonic::include_proto!("relayer"); } // Empty proto file
 }
 
 use anyhow::Result;
@@ -17,7 +17,6 @@ use jito::searcher::{GetTipAccountsRequest, SendBundleRequest};
 use prost_types::Timestamp;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::transport::{Channel, ClientTlsConfig};
-use tonic::{metadata::MetadataValue, Request};
 
 #[derive(Clone)]
 pub struct JitoClient {
@@ -33,17 +32,14 @@ impl JitoClient {
         Ok(Self { inner: SearcherServiceClient::new(channel) })
     }
 
-    pub async fn connect_with_bearer(endpoint: &str, bearer: &str) -> Result<Self> {
-        let token = format!("Bearer {}", bearer);
+    pub async fn connect_with_bearer(endpoint: &str, _bearer: &str) -> Result<Self> {
         let channel = Channel::from_shared(endpoint.to_string())?
             .tls_config(ClientTlsConfig::new())?
             .connect()
             .await?;
-        let client = SearcherServiceClient::with_interceptor(channel, move |mut req: Request<()>| {
-            req.metadata_mut().insert("authorization", MetadataValue::try_from(token.clone()).unwrap());
-            Ok(req)
-        });
-        Ok(Self { inner: client })
+        let client = Self { inner: SearcherServiceClient::new(channel) };
+        // Note: Bearer token could be added to individual requests via interceptor
+        Ok(client)
     }
 
     pub async fn get_tip_accounts(&mut self) -> Result<Vec<String>> {

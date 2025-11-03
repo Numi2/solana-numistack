@@ -1,7 +1,7 @@
 // crates/ultra-aggregator/src/main.rs
 #![forbid(unsafe_code)]
 use anyhow::Result;
-use faststreams::{decode_record, Record};
+use faststreams::{Record};
 use bytes::{Buf, BytesMut};
 use metrics::{counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -60,7 +60,7 @@ fn json_view(rec: &Record) -> serde_json::Value {
         Record::EndOfStartup => serde_json::json!({"type": "end_of_startup"}),
     }
 }
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct Cfg {
     uds_path: String,
     stdout_json: bool,
@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
     };
 
     if let Some(addr) = &cfg.metrics_addr {
-        let _ = PrometheusBuilder::new().with_http_listener(addr.parse().unwrap()).install();
+        let _ = PrometheusBuilder::new().with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap()).install();
     }
 
     if Path::new(&cfg.uds_path).exists() {
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
     // best-effort: set perms to 0660 for controlled access
     #[cfg(unix)] {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&cfg.uds_path) {
+        if let Ok(_meta) = std::fs::metadata(&cfg.uds_path) {
             let _ = std::fs::set_permissions(&cfg.uds_path, std::fs::Permissions::from_mode(0o660));
         }
     }
@@ -162,12 +162,21 @@ async fn main() -> Result<()> {
             }
             Ok((sock, _)) = listener.accept() => {
                 let cfg_clone = cfg.clone();
-                #[cfg(feature = "kafka")] let ks = kafka_sink.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(sock, cfg_clone, ks).await {
-                        error!("client error: {e:?}");
-                    }
-                });
+                #[cfg(feature = "kafka")] {
+                    let ks = kafka_sink.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(sock, cfg_clone, ks).await {
+                            error!("client error: {e:?}");
+                        }
+                    });
+                }
+                #[cfg(not(feature = "kafka"))] {
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(sock, cfg_clone).await {
+                            error!("client error: {e:?}");
+                        }
+                    });
+                }
             }
         }
     }
@@ -182,8 +191,8 @@ async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")]
         if n == 0 { break; }
 
         // Try to peel records out
-        let mut cursor = std::io::Cursor::new(&buf[..]);
         loop {
+            let mut cursor = std::io::Cursor::new(&buf[..]);
             let pos = cursor.position() as usize;
             match faststreams::decode_record(&mut cursor) {
                 Ok(rec) => {
@@ -194,6 +203,8 @@ async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")]
                     counter!("ultra_records_ingested_total").increment(1);
                     #[cfg(feature = "kafka")]
                     if let Some(k) = &ks { k.try_send(rec); }
+                    let consumed = cursor.position() as usize;
+                    buf.advance(consumed);
                 }
                 Err(faststreams::StreamError::BadHeader) => {
                     // desync; drop up to pos+1
@@ -208,11 +219,6 @@ async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")]
                 }
                 Err(faststreams::StreamError::Ser(_)) => break,
             }
-        }
-        // advance consumed bytes without copying
-        let consumed = cursor.position() as usize;
-        if consumed > 0 && consumed <= buf.len() {
-            buf.advance(consumed);
         }
     }
     Ok(())

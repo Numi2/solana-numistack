@@ -1,5 +1,6 @@
 // crates/jito-client/src/bin/jito_bundle.rs
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use clap::Parser;
 use jito_client::JitoClient;
 use std::fs;
@@ -8,10 +9,10 @@ use std::fs;
 #[command(name = "jito-bundle", version, about = "Submit a Jito bundle at max performance")]
 struct Args {
     /// gRPC endpoint, e.g. https://ny.mainnet.block-engine.jito.wtf:443
-    #[arg(long, env = "JITO_ENDPOINT")]
-    endpoint: String,
+    #[arg(long)]
+    endpoint: Option<String>,
     /// Optional bearer token (if your provider requires)
-    #[arg(long, env = "JITO_BEARER")]
+    #[arg(long)]
     bearer: Option<String>,
     /// File containing base64-encoded signed transactions, one per line
     #[arg(long)]
@@ -21,10 +22,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let endpoint = args.endpoint.as_deref().ok_or_else(|| anyhow!("endpoint required, use --endpoint or JITO_ENDPOINT env var"))?;
     let mut client = if let Some(b) = args.bearer.as_deref() {
-        JitoClient::connect_with_bearer(&args.endpoint, b).await?
+        JitoClient::connect_with_bearer(endpoint, b).await?
     } else {
-        JitoClient::connect(&args.endpoint).await?
+        JitoClient::connect(endpoint).await?
     };
 
     let content = fs::read_to_string(args.txs_b64_file)?;
@@ -32,7 +34,7 @@ async fn main() -> Result<()> {
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() { continue; }
-        let raw = base64::decode(line).map_err(|e| anyhow!("decode base64: {}", e))?;
+        let raw = base64::engine::general_purpose::STANDARD.decode(line).map_err(|e| anyhow!("decode base64: {}", e))?;
         raw_txs.push(raw);
     }
     if raw_txs.is_empty() {

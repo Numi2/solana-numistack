@@ -1,6 +1,5 @@
 // crates/faststreams/src/lib.rs
 #![forbid(unsafe_code)]
-use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::io::IoSlice;
@@ -27,6 +26,7 @@ pub struct AccountUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxUpdate {
     pub slot: u64,
+    #[serde(with = "serde_bytes")]
     pub signature: [u8; 64],
     pub err: Option<String>,
     pub vote: bool,
@@ -35,10 +35,12 @@ pub struct TxUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockMeta {
     pub slot: u64,
+    #[serde(with = "serde_bytes")]
     pub blockhash: Option<[u8; 32]>,
     pub parent_slot: u64,
     pub rewards_len: u32,
     pub block_time_unix: Option<i64>,
+    #[serde(with = "serde_bytes")]
     pub leader: Option<[u8; 32]>,
 }
 
@@ -56,7 +58,7 @@ pub enum StreamError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("deserialize: {0}")]
-    De(#[from] Box<bincode::ErrorKind>),
+    De(Box<bincode::ErrorKind>),
     #[error("serialize: {0}")]
     Ser(#[from] bincode::Error),
     #[error("bad magic or version")]
@@ -108,7 +110,8 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
     // Build IoSlice array over immutable frame data
     let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(&f[..])).collect();
     let mut offset = 0usize;
-    while offset < slices.len() {
+    let total_slices = slices.len();
+    while offset < total_slices {
         let n = dst.write_vectored(&slices[offset..])?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
@@ -116,16 +119,38 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
 
         // Advance IoSlice array by the number of bytes written
         let mut remaining = n;
-        while remaining > 0 {
-            if remaining >= slices[offset].len() {
-                remaining -= slices[offset].len();
+        while remaining > 0 && offset < slices.len() {
+            let current_len = slices[offset].len();
+            if remaining >= current_len {
+                remaining -= current_len;
                 offset += 1;
-                if offset >= slices.len() { break; }
             } else {
-                // Trim the current slice to account for partial write
-                let cur = &slices[offset];
-                let new = IoSlice::new(&cur[(remaining)..]);
-                slices[offset] = new;
+                // For partial writes, we need to adjust the slice
+                // This is complex due to borrow checker, so let's use a simpler approach
+                // Create new slices starting from the partial position
+                let start_offset = offset;
+                let mut new_slices = Vec::new();
+
+                // Copy fully consumed slices
+                for i in 0..start_offset {
+                    new_slices.push(slices[i]);
+                }
+
+                // Handle the partially consumed slice
+                if start_offset < slices.len() {
+                    let original_data = frames[start_offset].as_slice();
+                    let consumed = frames[start_offset].len() - slices[start_offset].len() + remaining;
+                    let remaining_data = &original_data[consumed..];
+                    new_slices.push(IoSlice::new(remaining_data));
+
+                    // Copy remaining slices
+                    for i in (start_offset + 1)..slices.len() {
+                        new_slices.push(slices[i]);
+                    }
+                }
+
+                slices = new_slices;
+                offset = start_offset;
                 remaining = 0;
             }
         }

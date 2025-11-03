@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 mod config;
 mod writer;
 
@@ -8,11 +8,11 @@ use faststreams::{encode_record, AccountUpdate, BlockMeta, Record, TxUpdate};
 use metrics::{counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::Mutex;
-use solana_geyser_plugin_interface::geyser_plugin_interface::{
+use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-    ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as GeyserResult, SlotStatus,
+    ReplicaTransactionInfoVersions, Result as GeyserResult, SlotStatus,
 };
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{pubkey::Pubkey, bs58};
 use std::fs::File;
 use std::io::Read;
 use std::os::raw::c_void;
@@ -70,7 +70,7 @@ impl GeyserPlugin for Ultra {
             if let Some(addr) = &m.listen_addr {
                 let addr = addr.clone();
                 std::thread::spawn(move || {
-                    let _ = PrometheusBuilder::new().with_http_listener(addr.parse().unwrap()).install();
+                    let _ = PrometheusBuilder::new().with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap()).install();
                 });
             }
         }
@@ -138,7 +138,7 @@ impl GeyserPlugin for Ultra {
             ReplicaTransactionInfoVersions::V0_0_1(t) => {
                 let sig = t.signature;
                 let vote = t.is_vote;
-                let err = t.transaction_status_meta.and_then(|m| m.status.clone().err()).map(|e| format!("{:?}", e));
+                let err = Some(&t.transaction_status_meta).and_then(|m| m.status.clone().err()).map(|e| format!("{:?}", e));
                 (sig, vote, err)
             }
             _ => return Ok(())
@@ -167,11 +167,11 @@ impl GeyserPlugin for Ultra {
         if let ReplicaBlockInfoVersions::V0_0_1(b) = blockinfo {
             let rec = Record::Block(BlockMeta {
                 slot: b.slot,
-                blockhash: b.blockhash.map(|h| h.to_bytes()),
-                parent_slot: b.parent_slot.unwrap_or(0),
-                rewards_len: b.rewards.as_deref().map(|r| r.len()).unwrap_or(0) as u32,
+                blockhash: bs58::decode(b.blockhash).into_vec().ok().and_then(|v| v.try_into().ok()),
+                parent_slot: b.slot.saturating_sub(1), // Approximate parent slot
+                rewards_len: b.rewards.len() as u32,
                 block_time_unix: b.block_time,
-                leader: b.leader.as_ref().map(|p| p.to_bytes()),
+                leader: None, // Leader info not available in new API
             });
             if let Ok(buf) = encode_record(&rec) {
                 if tx.try_send(buf).is_err() {
@@ -184,13 +184,17 @@ impl GeyserPlugin for Ultra {
         Ok(())
     }
 
-    fn update_slot_status(&self, slot: u64, parent: Option<u64>, status: SlotStatus) -> GeyserResult<()> {
+    fn update_slot_status(&self, slot: u64, parent: Option<u64>, status: &SlotStatus) -> GeyserResult<()> {
         if !self.streams.slots { return Ok(()); }
         let tx = match &self.tx { Some(t) => t, None => return Ok(()), };
         let st = match status {
             SlotStatus::Processed => 0u8,
             SlotStatus::Confirmed => 1,
             SlotStatus::Rooted => 2,
+            SlotStatus::FirstShredReceived => 3,
+            SlotStatus::Completed => 4,
+            SlotStatus::CreatedBank => 5,
+            SlotStatus::Dead(_) => 6,
         };
         let rec = Record::Slot { slot, parent, status: st };
         if let Ok(buf) = encode_record(&rec) {

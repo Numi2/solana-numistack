@@ -18,10 +18,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 faststreams = { path = "../faststreams" }
-# Solana Geyser interface pinned to current series (Agave/1.18.x)
-solana-geyser-plugin-interface = "1.18.26"
-solana-transaction-status = "1.18.26"
-solana-sdk = "1.18.26"
+log = "0.4.28"
+# Agave Geyser interface with latest versions
+agave-geyser-plugin-interface = "3.0.8"
+solana-transaction-status = "3.0.8"
+solana-sdk = "3.0.0"
 
 [dependencies.metrics]
 version = "0.23.0"

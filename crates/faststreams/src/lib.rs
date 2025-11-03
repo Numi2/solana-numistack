@@ -82,6 +82,11 @@ impl EncodeOptions {
         // Disable compression for low-latency local sockets
         Self { enable_compression: false, compress_threshold: usize::MAX }
     }
+    /// Throughput-oriented remote hop: enable LZ4 with a low threshold to
+    /// compress even relatively small payloads.
+    pub fn throughput_lz4_low() -> Self {
+        Self { enable_compression: true, compress_threshold: 512 }
+    }
 }
 
 pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
@@ -118,6 +123,40 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
         buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
         bincode_opts.serialize_into(&mut buf, rec)?;
         Ok(buf)
+    }
+}
+
+/// Encode into the provided buffer, reusing its capacity when possible.
+/// The buffer is cleared before writing and will contain one full frame on success.
+pub fn encode_into_with(rec: &Record, buf: &mut Vec<u8>, opts: EncodeOptions) -> Result<(), StreamError> {
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
+    buf.clear();
+    if opts.enable_compression {
+        let payload = bincode_opts.serialize(rec)?;
+        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
+            let compressed = lz4_flex::block::compress_prepend_size(&payload);
+            (FLAG_LZ4, compressed)
+        } else {
+            (0, payload)
+        };
+        buf.reserve(4 + 2 + 2 + 4 + body.len());
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        Ok(())
+    } else {
+        let payload_len = bincode_opts.serialized_size(rec)? as usize;
+        buf.reserve(4 + 2 + 2 + 4 + payload_len);
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        bincode_opts.serialize_into(buf, rec)?;
+        Ok(())
     }
 }
 
@@ -202,6 +241,54 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
                 if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
             } else {
                 let s = &frames[idx];
+                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+            }
+            added += 1;
+            idx += 1;
+        }
+
+        let n = dst.write_vectored(&iovecs)?;
+        if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+
+        let mut remaining = n;
+        while remaining > 0 {
+            let slice_len = if first_offset != 0 {
+                frames[frame_idx].len() - first_offset
+            } else {
+                frames[frame_idx].len()
+            };
+            if remaining >= slice_len {
+                remaining -= slice_len;
+                frame_idx += 1;
+                first_offset = 0;
+                if frame_idx >= frames.len() { break; }
+            } else {
+                first_offset += remaining;
+                remaining = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a batch of byte slices using vectored IO and handle partial writes.
+pub fn write_all_vectored_slices(mut dst: impl Write, frames: &[&[u8]]) -> io::Result<()> {
+    let mut frame_idx: usize = 0;
+    let mut first_offset: usize = 0; // byte offset inside frames[frame_idx]
+    let iov_max = IOV_MAX_DEFAULT;
+
+    while frame_idx < frames.len() {
+        let remaining_frames = frames.len() - frame_idx;
+        let pre_cap = if remaining_frames < iov_max { remaining_frames } else { iov_max };
+        let mut iovecs: SmallVec<[IoSlice<'_>; 256]> = SmallVec::with_capacity(pre_cap);
+        let mut added = 0usize;
+        let mut idx = frame_idx;
+        while idx < frames.len() && added < iov_max {
+            if idx == frame_idx && first_offset != 0 {
+                let s = &frames[idx][first_offset..];
+                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+            } else {
+                let s = frames[idx];
                 if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
             }
             added += 1;

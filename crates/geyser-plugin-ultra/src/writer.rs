@@ -9,10 +9,42 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use socket2::SockRef;
+#[cfg(target_os = "linux")]
+use nix::sched::{sched_setaffinity, CpuSet};
+#[cfg(target_os = "linux")]
+use nix::unistd::Pid;
+#[cfg(target_os = "linux")]
+use libc;
 
 pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(core) = cfg.pin_core {
+            match CpuSet::new().and_then(|mut set| { let _ = set.set(core); Ok(set) }) {
+                Ok(cpuset) => {
+                    if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpuset) {
+                        eprintln!("geyser-plugin-ultra: failed to set CPU affinity to core {core}: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("geyser-plugin-ultra: failed to build CPU set for core {core}: {e}");
+                }
+            }
+        }
+        if let Some(prio) = cfg.rt_priority {
+            let policy_str = cfg.sched_policy.as_deref().unwrap_or("fifo");
+            let policy = if policy_str.eq_ignore_ascii_case("rr") { libc::SCHED_RR } else { libc::SCHED_FIFO };
+            let param = libc::sched_param { sched_priority: prio };
+            unsafe {
+                if libc::sched_setscheduler(0, policy, &param) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("geyser-plugin-ultra: failed to set RT scheduler ({policy_str}, prio {prio}): {err}");
+                }
+            }
+        }
+    }
     thread_local! {
-        static HISTO_SEQ: Cell<u64> = Cell::new(0);
+        static HISTO_SEQ: Cell<u64> = const { Cell::new(0) };
     }
     const HISTO_SAMPLE_MASK: u64 = 0xF; // sample 1/16
     let mut backoff = Duration::from_millis(50);

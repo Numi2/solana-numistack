@@ -22,6 +22,12 @@ pub struct Config {
     pub batch_bytes_max: usize,
     #[serde(default = "default_flush_after_ms")]
     pub flush_after_ms: u64,
+    #[serde(default)]
+    pub pin_core: Option<usize>,
+    #[serde(default)]
+    pub rt_priority: Option<i32>,
+    #[serde(default)]
+    pub sched_policy: Option<String>,
     #[serde(default = "default_streams")]
     pub streams: Streams,
     #[serde(default)]
@@ -37,13 +43,13 @@ fn default_capacity() -> usize {
     65_536
 }
 fn default_batch() -> usize {
-    512
+    256
 }
 fn default_batch_bytes() -> usize {
-    1 * 1024 * 1024
+    2 * 1024 * 1024
 }
 fn default_flush_after_ms() -> u64 {
-    1
+    0
 }
 fn default_streams() -> Streams {
     Streams { accounts: true, transactions: true, blocks: true, slots: true }

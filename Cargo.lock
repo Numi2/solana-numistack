@@ -1191,6 +1191,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "faststreams",
+ "libc",
  "log",
  "metrics",
  "metrics-exporter-prometheus",

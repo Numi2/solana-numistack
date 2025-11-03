@@ -10,6 +10,12 @@ Restart=always
 RestartSec=2
 User=sol
 Group=sol
+LimitNOFILE=1048576
+TasksMax=infinity
+# Optional: pin to specific CPUs to reduce jitter
+# CPUAffinity=0 1 2 3
+# Optional: NUMA pin (replace ExecStart above if desired)
+# ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 /usr/local/bin/ultra-aggregator /etc/ultra/aggregator.json
 
 [Install]
 WantedBy=multi-user.target

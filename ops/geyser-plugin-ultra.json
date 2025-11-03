@@ -2,8 +2,10 @@
 {
     "libpath": "/usr/local/lib/libgeyser_plugin_ultra.so",
     "socket_path": "/var/run/ultra-geyser.sock",
-    "queue_capacity": 262144,
-    "batch_max": 4096,
+  "queue_capacity": 65536,
+  "batch_max": 512,
+  "batch_bytes_max": 1048576,
+  "flush_after_ms": 1,
     "streams": {
       "accounts": true,
       "transactions": true,

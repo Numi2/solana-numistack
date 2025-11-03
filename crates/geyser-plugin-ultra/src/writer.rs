@@ -3,6 +3,7 @@ use crate::Config;
 use crossbeam_channel::Receiver;
 use faststreams::write_all_vectored;
 use metrics::{counter, histogram};
+use std::cell::Cell;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
@@ -10,6 +11,10 @@ use std::time::{Duration, Instant};
 use socket2::SockRef;
 
 pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    thread_local! {
+        static HISTO_SEQ: Cell<u64> = Cell::new(0);
+    }
+    const HISTO_SAMPLE_MASK: u64 = 0xF; // sample 1/16
     let mut backoff = Duration::from_millis(50);
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -58,7 +63,13 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
                             let elapsed = start.elapsed().as_nanos() as f64 / 1_000_000.0;
                             counter!("ultra_bytes_sent_total").increment(size as u64);
                             counter!("ultra_batches_sent_total").increment(1);
-                            histogram!("ultra_batch_ms").record(elapsed);
+                            HISTO_SEQ.with(|seq| {
+                                let v = seq.get();
+                                seq.set(v.wrapping_add(1));
+                                if (v & HISTO_SAMPLE_MASK) == 0 {
+                                    histogram!("ultra_batch_ms").record(elapsed);
+                                }
+                            });
                             batch.clear();
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,

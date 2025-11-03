@@ -25,22 +25,68 @@ pub struct JitoClient {
 
 impl JitoClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        let env_u32 = |k: &str, d: u32| -> u32 {
+            std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(d)
+        };
+        let env_u64 = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d)
+        };
+        let env_usize = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+
+        let init_conn_window = env_u32("JITO_INIT_CONN_WINDOW", 8 * 1024 * 1024);
+        let init_stream_window = env_u32("JITO_INIT_STREAM_WINDOW", 8 * 1024 * 1024);
+        let keepalive_interval_ms = env_u64("JITO_HTTP2_KEEPALIVE_INTERVAL_MS", 1_000);
+        let keepalive_timeout_ms = env_u64("JITO_HTTP2_KEEPALIVE_TIMEOUT_MS", 3_000);
+        let tcp_keepalive_secs = env_u64("JITO_TCP_KEEPALIVE_SECS", 30);
+        let concurrency_limit = env_usize("JITO_CONCURRENCY_LIMIT", 64);
+
         let channel = Channel::from_shared(endpoint.to_string())?
             .tls_config(ClientTlsConfig::new())?
             .tcp_nodelay(true)
-            .http2_keep_alive_interval(Duration::from_secs(1))
+            .tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)))
+            .http2_adaptive_window(true)
+            .initial_connection_window_size(init_conn_window)
+            .initial_stream_window_size(init_stream_window)
+            .http2_keep_alive_interval(Duration::from_millis(keepalive_interval_ms))
+            .keep_alive_timeout(Duration::from_millis(keepalive_timeout_ms))
             .keep_alive_while_idle(true)
+            .concurrency_limit(concurrency_limit)
             .connect()
             .await?;
         Ok(Self { inner: SearcherServiceClient::new(channel) })
     }
 
     pub async fn connect_with_bearer(endpoint: &str, _bearer: &str) -> Result<Self> {
+        let env_u32 = |k: &str, d: u32| -> u32 {
+            std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(d)
+        };
+        let env_u64 = |k: &str, d: u64| -> u64 {
+            std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d)
+        };
+        let env_usize = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+
+        let init_conn_window = env_u32("JITO_INIT_CONN_WINDOW", 8 * 1024 * 1024);
+        let init_stream_window = env_u32("JITO_INIT_STREAM_WINDOW", 8 * 1024 * 1024);
+        let keepalive_interval_ms = env_u64("JITO_HTTP2_KEEPALIVE_INTERVAL_MS", 1_000);
+        let keepalive_timeout_ms = env_u64("JITO_HTTP2_KEEPALIVE_TIMEOUT_MS", 3_000);
+        let tcp_keepalive_secs = env_u64("JITO_TCP_KEEPALIVE_SECS", 30);
+        let concurrency_limit = env_usize("JITO_CONCURRENCY_LIMIT", 64);
+
         let channel = Channel::from_shared(endpoint.to_string())?
             .tls_config(ClientTlsConfig::new())?
             .tcp_nodelay(true)
-            .http2_keep_alive_interval(Duration::from_secs(1))
+            .tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)))
+            .http2_adaptive_window(true)
+            .initial_connection_window_size(init_conn_window)
+            .initial_stream_window_size(init_stream_window)
+            .http2_keep_alive_interval(Duration::from_millis(keepalive_interval_ms))
+            .keep_alive_timeout(Duration::from_millis(keepalive_timeout_ms))
             .keep_alive_while_idle(true)
+            .concurrency_limit(concurrency_limit)
             .connect()
             .await?;
         let client = Self { inner: SearcherServiceClient::new(channel) };

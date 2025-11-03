@@ -84,22 +84,37 @@ impl EncodeOptions {
 }
 
 pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
-    let payload = bincode::serialize(rec)?;
-    let (flags, body): (u16, Vec<u8>) = if opts.enable_compression && payload.len() >= opts.compress_threshold {
-        let compressed = lz4_flex::block::compress_prepend_size(&payload);
-        (FLAG_LZ4, compressed)
-    } else {
-        (0, payload)
-    };
+    if opts.enable_compression {
+        // Compress only when enabled and above threshold. This path incurs a payload allocation,
+        // which is acceptable for throughput-oriented configurations.
+        let payload = bincode::serialize(rec)?;
+        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
+            let compressed = lz4_flex::block::compress_prepend_size(&payload);
+            (FLAG_LZ4, compressed)
+        } else {
+            (0, payload)
+        };
 
-    // header: magic(4) | version(2) | flags(2) | len(4)
-    let mut buf: Vec<u8> = Vec::with_capacity(4 + 2 + 2 + 4 + body.len());
-    buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-    buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-    buf.extend_from_slice(&flags.to_be_bytes());
-    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&body);
-    Ok(buf)
+        // header: magic(4) | version(2) | flags(2) | len(4)
+        let mut buf: Vec<u8> = Vec::with_capacity(4 + 2 + 2 + 4 + body.len());
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        Ok(buf)
+    } else {
+        // Low-latency path: avoid an intermediate payload allocation by sizing once and
+        // serializing directly into the final buffer after writing the header.
+        let payload_len = bincode::serialized_size(rec)? as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(4 + 2 + 2 + 4 + payload_len);
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        bincode::serialize_into(&mut buf, rec)?;
+        Ok(buf)
+    }
 }
 
 pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {
@@ -166,7 +181,9 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
     let iov_max = IOV_MAX_DEFAULT;
 
     while frame_idx < frames.len() {
-        let mut iovecs: SmallVec<[IoSlice<'_>; 256]> = SmallVec::new();
+        let remaining_frames = frames.len() - frame_idx;
+        let pre_cap = if remaining_frames < iov_max { remaining_frames } else { iov_max };
+        let mut iovecs: SmallVec<[IoSlice<'_>; 256]> = SmallVec::with_capacity(pre_cap);
         let mut added = 0usize;
         let mut idx = frame_idx;
         while idx < frames.len() && added < iov_max {

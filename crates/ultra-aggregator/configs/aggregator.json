@@ -1,7 +1,7 @@
 
 {
   "uds_path": "/var/run/ultra-geyser.sock",
-  "stdout_json": true,
+  "stdout_json": false,
   "metrics_addr": "0.0.0.0:9978"
 
 }

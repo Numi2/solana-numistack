@@ -15,6 +15,9 @@ bincode = { workspace = true }
 yellowstone-grpc-proto = { version = "10.1.1", default-features = false, features = ["tonic","tonic-compression"] }
 yellowstone-grpc-client = { version = "10.1.1", default-features = false }
 crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
 bs58 = "0.5.1"
 tonic = "0.12"
 socket2 = { version = "0.5.7", features = ["all"] }
+metrics = "0.23.0"
+metrics-exporter-prometheus = "0.15.3"

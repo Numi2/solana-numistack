@@ -34,16 +34,16 @@ pub struct Metrics {
 }
 
 fn default_capacity() -> usize {
-    262_144
+    65_536
 }
 fn default_batch() -> usize {
-    4096
+    512
 }
 fn default_batch_bytes() -> usize {
-    4 * 1024 * 1024
+    1 * 1024 * 1024
 }
 fn default_flush_after_ms() -> u64 {
-    2
+    1
 }
 fn default_streams() -> Streams {
     Streams { accounts: true, transactions: true, blocks: true, slots: true }

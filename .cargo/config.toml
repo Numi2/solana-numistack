@@ -1,6 +1,5 @@
 [build]
 rustflags = [
   "-C", "target-cpu=native",
-  "-C", "inline-threshold=275",
   "-C", "embed-bitcode=no",
 ]

@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 use bs58;
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct KafkaCfg {
     brokers: String,
     topic_accounts: String,

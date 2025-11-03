@@ -10,6 +10,7 @@ pub struct Streams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Config {
     pub libpath: String,
     pub socket_path: String,

@@ -20,7 +20,7 @@ use tracing::{error, info};
 
 /// Writer thread: drains frames from the channel and writes to the UDS with minimal latency.
 /// NOTE: For best results pin this thread to an isolated CPU core (see comment below).
-pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, queue_depth_max: Arc<AtomicU64>) {
+pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, queue_depth_max: Arc<AtomicU64>, processed_total: Arc<AtomicU64>) {
     // NOTE: For lowest tail latency in production, consider isolating the pinned core from the
     // general scheduler using kernel boot parameters, e.g. isolcpus=nohz,managed_irq,domain,1
     // and moving other background daemons off that core. This complements RT scheduling below.
@@ -62,6 +62,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
     let mut backoff_seq: u64 = 0;
     let mut last_connect_log: Option<Instant> = None;
     let mut last_logged_backoff: Duration = Duration::from_millis(0);
+    gauge!("ultra_writer_alive").set(1.0);
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -81,6 +82,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                 if let Ok(effective) = sockref.send_buffer_size() { info!(target = "ultra.writer", "send buffer size ~{} bytes", effective); }
                 // Batch & drain loop
                 let mut batch: Vec<PooledBuf> = Vec::with_capacity(cfg.batch_max);
+                let mut slices: Vec<&[u8]> = Vec::with_capacity(cfg.batch_max);
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -88,7 +90,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                     // Shutdown-responsive first receive
                     match rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(first) => {
-                            let mut size = first.as_ref().len();
+                            let mut size = first.as_slice().map(|s| s.len()).unwrap_or(0);
                             batch.push(first);
                             let start = Instant::now();
                             let deadline = if cfg.flush_after_ms > 0 { Some(start + Duration::from_millis(cfg.flush_after_ms)) } else { None };
@@ -96,7 +98,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                                 if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
                                 match rx.try_recv() {
                                     Ok(m) => {
-                                        let mlen = m.as_ref().len();
+                                        let mlen = m.as_slice().map(|s| s.len()).unwrap_or(0);
                                         if size + mlen > cfg.batch_bytes_max { break; }
                                         size += mlen;
                                         batch.push(m);
@@ -110,7 +112,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                                             let remaining = dl.saturating_duration_since(now);
                                             match rx.recv_timeout(remaining) {
                                                 Ok(m) => {
-                                                    let mlen = m.as_ref().len();
+                                                    let mlen = m.as_slice().map(|s| s.len()).unwrap_or(0);
                                                     if size + mlen > cfg.batch_bytes_max { break; }
                                                     size += mlen;
                                                     batch.push(m);
@@ -127,7 +129,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                             }
                             let write_start = Instant::now();
                             // Build borrowed slices for this batch
-                            let mut slices: Vec<&[u8]> = Vec::with_capacity(batch.len());
+                            slices.clear();
                             for b in &batch { if let Some(s) = b.as_slice() { slices.push(s); } }
                             // Transient backpressure handling
                             loop {
@@ -164,6 +166,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                                     Err(actual) => cur = actual,
                                 }
                             }
+                            processed_total.fetch_add(batch.len() as u64, Ordering::Relaxed);
                             batch.clear();
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => { if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; } else { continue; } }
@@ -196,5 +199,6 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
             }
         };
     }
+    gauge!("ultra_writer_alive").set(0.0);
 }
         

@@ -15,17 +15,16 @@ impl BufferPool {
         Arc::new(Self { q: ArrayQueue::new(max_items), default_capacity })
     }
 
-    /// Get a pooled buffer wrapped in `PooledBuf`. The buffer is empty and ready to write.
+    /// Get a pooled buffer or allocate a new one with default capacity.
     pub fn get(self: &Arc<Self>) -> PooledBuf {
-        let buf = match self.q.pop() {
-            Some(b) => b,
-            None => {
-                counter!("ultra_pool_get_miss_total").increment(1);
-                Vec::with_capacity(self.default_capacity)
-            }
-        };
-        gauge!("ultra_pool_q_len").set(self.q.len() as f64);
-        PooledBuf { inner: Some(buf), pool: Arc::clone(self) }
+        if let Some(p) = self.try_get() { p } else { PooledBuf { inner: Some(Vec::with_capacity(self.default_capacity)), pool: Arc::clone(self) } }
+    }
+
+    /// Get a pooled buffer if available. Returns `None` when pool is empty to keep memory bounded.
+    pub fn try_get(self: &Arc<Self>) -> Option<PooledBuf> {
+        let buf = match self.q.pop() { Some(b) => Some(b), None => { counter!("ultra_pool_get_miss_total").increment(1); None } };
+        gauge!("ultra_pool_len").set(self.q.len() as f64);
+        buf.map(|b| PooledBuf { inner: Some(b), pool: Arc::clone(self) })
     }
 
     fn put(&self, mut buf: Vec<u8>) {
@@ -37,7 +36,7 @@ impl BufferPool {
         if self.q.push(buf).is_err() {
             counter!("ultra_pool_full_total").increment(1);
         }
-        gauge!("ultra_pool_q_len").set(self.q.len() as f64);
+        gauge!("ultra_pool_len").set(self.q.len() as f64);
     }
 }
 
@@ -62,7 +61,15 @@ impl PooledBuf {
     }
 }
 
-// Intentionally omit AsRef<[u8]> to avoid accidental panics; callers must handle Option.
+impl AsRef<[u8]> for PooledBuf {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match &self.inner {
+            Some(v) => v.as_slice(),
+            None => &[],
+        }
+    }
+}
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {

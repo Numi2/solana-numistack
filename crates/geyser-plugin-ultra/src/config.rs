@@ -1,7 +1,7 @@
 // crates/geyser-plugin-ultra/src/config.rs
 use serde::Deserialize;
 use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -89,15 +89,17 @@ pub struct ValidatedConfig {
     pub batch_bytes_max: usize,
     pub flush_after_ms: u64,
     pub write_timeout_ms: u64,
+    #[cfg(target_os = "linux")]
     pub pin_core: Option<usize>,
+    #[cfg(target_os = "linux")]
     pub rt_priority: Option<i32>,
+    #[cfg(target_os = "linux")]
     pub sched_policy: Option<String>,
     pub histogram_sample_log2: u8,
     pub streams: Streams,
     pub metrics: Option<Metrics>,
     pub pool_items_max: usize,
     pub pool_default_cap: usize,
-    pub memory_budget_bytes: Option<usize>,
 }
 
 impl Config {
@@ -153,15 +155,17 @@ impl Config {
             batch_bytes_max: self.batch_bytes_max,
             flush_after_ms: self.flush_after_ms,
             write_timeout_ms: self.write_timeout_ms,
+            #[cfg(target_os = "linux")]
             pin_core: self.pin_core,
+            #[cfg(target_os = "linux")]
             rt_priority: self.rt_priority,
+            #[cfg(target_os = "linux")]
             sched_policy: self.sched_policy.clone(),
             histogram_sample_log2: self.histogram_sample_log2,
             streams: self.streams.clone(),
             metrics: self.metrics.clone(),
             pool_items_max,
             pool_default_cap,
-            memory_budget_bytes: self.memory_budget_bytes,
         })
     }
 }

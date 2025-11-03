@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::io::Write;
 use serde::ser::{SerializeMap, Serializer};
 
+#[cfg(feature = "kafka")]
 #[derive(Debug, serde::Deserialize)]
-
 struct KafkaCfg {
     brokers: String,
     topic_accounts: String,

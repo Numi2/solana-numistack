@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::unwrap_used, clippy::expect_used)]
 mod config;
 mod writer;
 mod pool;
@@ -9,12 +10,12 @@ use faststreams::{encode_into_with, encode_record_ref_into_with, EncodeOptions, 
 use metrics::{counter, histogram, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
-use tracing::{debug, info, error};
+use tracing::debug;
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
     ReplicaTransactionInfoVersions, Result as GeyserResult, SlotStatus,
 };
-use solana_sdk; // no direct imports
+// no direct imports
 use std::fs::File;
 use std::io::Read;
 use std::os::raw::c_void;
@@ -23,7 +24,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-#[derive(Debug)]
 struct Ultra {
     cfg: Option<ValidatedConfig>,
     tx: Option<Sender<pool::PooledBuf>>,
@@ -38,6 +38,22 @@ struct Ultra {
     dropped_total: AtomicU64,
     encode_error_total: AtomicU64,
     queue_depth_max: Arc<AtomicU64>,
+    processed_total: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+struct PluginError(String);
+
+impl std::fmt::Display for PluginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
+
+impl std::error::Error for PluginError {}
+
+impl std::fmt::Debug for Ultra {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ultra").finish()
+    }
 }
 
 impl Ultra {
@@ -56,6 +72,7 @@ impl Ultra {
             dropped_total: AtomicU64::new(0),
             encode_error_total: AtomicU64::new(0),
             queue_depth_max: Arc::new(AtomicU64::new(0)),
+            processed_total: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -71,7 +88,7 @@ impl GeyserPlugin for Ultra {
         let mut set = self.logger_set.lock();
         if !*set {
             log::set_max_level(level);
-            log::set_logger(logger).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+            log::set_logger(logger).map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
             *set = true;
         }
         Ok(())
@@ -79,11 +96,11 @@ impl GeyserPlugin for Ultra {
 
     fn on_load(&mut self, config_file: &str, _is_reload: bool) -> GeyserResult<()> {
         // Read JSON config
-        let mut f = File::open(config_file).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+        let mut f = File::open(config_file).map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
         let mut s = String::new();
-        f.read_to_string(&mut s).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
-        let cfg_raw: Config = serde_json::from_str(&s).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
-        let cfg = cfg_raw.validate().map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+        f.read_to_string(&mut s).map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
+        let cfg_raw: Config = serde_json::from_str(&s).map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
+        let cfg = cfg_raw.validate().map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
 
         // Metrics
         if let Some(m) = &cfg.metrics {
@@ -112,9 +129,10 @@ impl GeyserPlugin for Ultra {
         let wcfg = cfg.clone();
         let shutdown = self.shutdown.clone();
         let qmax = Arc::clone(&self.queue_depth_max);
+        let processed = Arc::clone(&self.processed_total);
         let jh = thread::Builder::new().name("ultra-writer".into()).spawn(move || {
-            writer::run_writer(wcfg, rx, &shutdown, qmax)
-        }).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+            writer::run_writer(wcfg, rx, &shutdown, qmax, processed)
+        }).map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
 
         self.streams = cfg.streams.clone();
         self.tx = Some(tx);
@@ -139,7 +157,8 @@ impl GeyserPlugin for Ultra {
         let drp = self.dropped_total.load(Ordering::Relaxed);
         let enc_err = self.encode_error_total.load(Ordering::Relaxed);
         let qmax = self.queue_depth_max.load(Ordering::Relaxed);
-        log::info!("ultra: unload summary enqueued={} dropped={} encode_errors={} max_queue_len={}", enq, drp, enc_err, qmax);
+        let processed = self.processed_total.load(Ordering::Relaxed);
+        log::info!("ultra: unload summary processed={} enqueued={} dropped={} encode_errors={} max_queue_len={}", processed, enq, drp, enc_err, qmax);
     }
 
     fn account_data_notifications_enabled(&self) -> bool { self.streams.accounts }
@@ -174,32 +193,37 @@ impl GeyserPlugin for Ultra {
             data,
         });
         if let Some(pool) = &self.pool {
-            let mut pb = pool.get();
-            if let Some(buf) = pb.inner_mut() {
-                let t0 = Instant::now();
-                match encode_record_ref_into_with(&aref, buf, EncodeOptions::latency_uds()) {
-                    Ok(()) => {
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 {
-                            histogram!("ultra_encode_ns", "kind" => "account").record(t0.elapsed().as_nanos() as f64);
-                            if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "account").record(sz as f64); }
-                        }
-                        if tx.try_send(pb).is_err() {
-                            self.dropped_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(mut pb) = pool.try_get() {
+                if let Some(buf) = pb.inner_mut() {
+                    let t0 = Instant::now();
+                    match encode_record_ref_into_with(&aref, buf, EncodeOptions::latency_uds()) {
+                        Ok(()) => {
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
-                        } else {
-                            self.enqueued_total.fetch_add(1, Ordering::Relaxed);
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                            if (v & 0xFF) == 0 {
+                                histogram!("ultra_encode_ns", "kind" => "account").record(t0.elapsed().as_nanos() as f64);
+                                if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "account").record(sz as f64); }
+                            }
+                            if tx.try_send(pb).is_err() {
+                                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
+                            } else {
+                                self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 { counter!("ultra_encode_error_total", "kind" => "account").increment(256); debug!(target = "ultra.encode", "account encode failed: {e}"); }
+                        Err(e) => {
+                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
+                            counter!("ultra_encode_error_total", "kind" => "account").increment(1);
+                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                            if (v & 0xFF) == 0 { debug!(target = "ultra.encode", "account encode failed: {e}"); }
+                        }
                     }
                 }
+            } else {
+                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                counter!("ultra_dropped_total", "reason" => "no_buf").increment(1);
             }
         }
         Ok(())
@@ -226,32 +250,37 @@ impl GeyserPlugin for Ultra {
             vote: is_vote,
         });
         if let Some(pool) = &self.pool {
-            let mut pb = pool.get();
-            if let Some(buf) = pb.inner_mut() {
-                let t0 = Instant::now();
-                match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
-                    Ok(()) => {
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 {
-                            histogram!("ultra_encode_ns", "kind" => "tx").record(t0.elapsed().as_nanos() as f64);
-                            if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "tx").record(sz as f64); }
-                        }
-                        if tx.try_send(pb).is_err() {
-                            self.dropped_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(mut pb) = pool.try_get() {
+                if let Some(buf) = pb.inner_mut() {
+                    let t0 = Instant::now();
+                    match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
+                        Ok(()) => {
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
-                        } else {
-                            self.enqueued_total.fetch_add(1, Ordering::Relaxed);
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                            if (v & 0xFF) == 0 {
+                                histogram!("ultra_encode_ns", "kind" => "tx").record(t0.elapsed().as_nanos() as f64);
+                                if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "tx").record(sz as f64); }
+                            }
+                            if tx.try_send(pb).is_err() {
+                                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
+                            } else {
+                                self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 { counter!("ultra_encode_error_total", "kind" => "tx").increment(256); debug!(target = "ultra.encode", "tx encode failed: {e}"); }
+                        Err(e) => {
+                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
+                            counter!("ultra_encode_error_total", "kind" => "tx").increment(1);
+                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                            if (v & 0xFF) == 0 { debug!(target = "ultra.encode", "tx encode failed: {e}"); }
+                        }
                     }
                 }
+            } else {
+                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                counter!("ultra_dropped_total", "reason" => "no_buf").increment(1);
             }
         }
         Ok(())
@@ -270,32 +299,37 @@ impl GeyserPlugin for Ultra {
                 leader: None, // Leader info not available in new API
             });
             if let Some(pool) = &self.pool {
-                let mut pb = pool.get();
-                if let Some(buf) = pb.inner_mut() {
-                    let t0 = Instant::now();
-                    match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
-                        Ok(()) => {
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
-                                histogram!("ultra_encode_ns", "kind" => "block").record(t0.elapsed().as_nanos() as f64);
-                                if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "block").record(sz as f64); }
-                            }
-                            if tx.try_send(pb).is_err() {
-                                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(mut pb) = pool.try_get() {
+                    if let Some(buf) = pb.inner_mut() {
+                        let t0 = Instant::now();
+                        match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
+                            Ok(()) => {
                                 let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                                if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
-                            } else {
-                                self.enqueued_total.fetch_add(1, Ordering::Relaxed);
-                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                                if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                                if (v & 0xFF) == 0 {
+                                    histogram!("ultra_encode_ns", "kind" => "block").record(t0.elapsed().as_nanos() as f64);
+                                    if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "block").record(sz as f64); }
+                                }
+                                if tx.try_send(pb).is_err() {
+                                    self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                    if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
+                                } else {
+                                    self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+                                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                    if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                                }
                             }
-                        }
-                        Err(e) => {
-                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_encode_error_total", "kind" => "block").increment(256); debug!(target = "ultra.encode", "block encode failed: {e}"); }
+                            Err(e) => {
+                                self.encode_error_total.fetch_add(1, Ordering::Relaxed);
+                                counter!("ultra_encode_error_total", "kind" => "block").increment(1);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { debug!(target = "ultra.encode", "block encode failed: {e}"); }
+                            }
                         }
                     }
+                } else {
+                    self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                    counter!("ultra_dropped_total", "reason" => "no_buf").increment(1);
                 }
             }
         }
@@ -316,32 +350,37 @@ impl GeyserPlugin for Ultra {
         };
         let rec = Record::Slot { slot, parent, status: st };
         if let Some(pool) = &self.pool {
-            let mut pb = pool.get();
-            if let Some(buf) = pb.inner_mut() {
-                let t0 = Instant::now();
-                match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
-                    Ok(()) => {
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 {
-                            histogram!("ultra_encode_ns", "kind" => "slot").record(t0.elapsed().as_nanos() as f64);
-                            if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "slot").record(sz as f64); }
-                        }
-                        if tx.try_send(pb).is_err() {
-                            self.dropped_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(mut pb) = pool.try_get() {
+                if let Some(buf) = pb.inner_mut() {
+                    let t0 = Instant::now();
+                    match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
+                        Ok(()) => {
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
-                        } else {
-                            self.enqueued_total.fetch_add(1, Ordering::Relaxed);
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                            if (v & 0xFF) == 0 {
+                                histogram!("ultra_encode_ns", "kind" => "slot").record(t0.elapsed().as_nanos() as f64);
+                                if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "slot").record(sz as f64); }
+                            }
+                            if tx.try_send(pb).is_err() {
+                                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { counter!("ultra_dropped_total", "reason" => "queue_full").increment(256); }
+                            } else {
+                                self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                                if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 { counter!("ultra_encode_error_total", "kind" => "slot").increment(256); debug!(target = "ultra.encode", "slot encode failed: {e}"); }
+                        Err(e) => {
+                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
+                            counter!("ultra_encode_error_total", "kind" => "slot").increment(1);
+                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                            if (v & 0xFF) == 0 { debug!(target = "ultra.encode", "slot encode failed: {e}"); }
+                        }
                     }
                 }
+            } else {
+                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                counter!("ultra_dropped_total", "reason" => "no_buf").increment(1);
             }
         }
         Ok(())
@@ -350,21 +389,26 @@ impl GeyserPlugin for Ultra {
     fn notify_end_of_startup(&self) -> GeyserResult<()> {
         let tx = match &self.tx { Some(t) => t, None => return Ok(()), };
         if let Some(pool) = &self.pool {
-            let mut pb = pool.get();
-            if let Some(buf) = pb.inner_mut() {
-                let t0 = Instant::now();
-                match encode_into_with(&Record::EndOfStartup, buf, EncodeOptions::latency_uds()) {
-                    Ok(()) => {
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 { histogram!("ultra_encode_ns", "kind" => "eos").record(t0.elapsed().as_nanos() as f64); if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "eos").record(sz as f64); } }
-                        let _ = tx.try_send(pb);
-                    }
-                    Err(e) => {
-                        self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        if (v & 0xFF) == 0 { counter!("ultra_encode_error_total", "kind" => "eos").increment(256); debug!(target = "ultra.encode", "eos encode failed: {e}"); }
+            if let Some(mut pb) = pool.try_get() {
+                if let Some(buf) = pb.inner_mut() {
+                    let t0 = Instant::now();
+                    match encode_into_with(&Record::EndOfStartup, buf, EncodeOptions::latency_uds()) {
+                        Ok(()) => {
+                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                            if (v & 0xFF) == 0 { histogram!("ultra_encode_ns", "kind" => "eos").record(t0.elapsed().as_nanos() as f64); if let Some(sz) = pb.as_slice().map(|s| s.len()) { histogram!("ultra_record_bytes", "kind" => "eos").record(sz as f64); } }
+                            let _ = tx.try_send(pb);
+                        }
+                        Err(e) => {
+                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
+                            counter!("ultra_encode_error_total", "kind" => "eos").increment(1);
+                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                            if (v & 0xFF) == 0 { debug!(target = "ultra.encode", "eos encode failed: {e}"); }
+                        }
                     }
                 }
+            } else {
+                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                counter!("ultra_dropped_total", "reason" => "no_buf").increment(1);
             }
         }
         Ok(())

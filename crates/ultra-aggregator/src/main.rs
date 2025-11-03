@@ -122,7 +122,7 @@ const INGEST_SAMPLE_WEIGHT: u64 = 256;
 enum JsonEvent {
     Account { slot: u64, is_startup: bool, pubkey: [u8; 32], lamports: u64, owner: [u8; 32], executable: bool, rent_epoch: u64, data_len: usize },
     Tx { slot: u64, signature: [u8; 64], err: Option<String>, vote: bool },
-    Block { slot: u64, blockhash: Option<[u8; 32]>, parent_slot: u64, rewards_len: u32, block_time_unix: Option<i64>, leader: Option<[u8; 32]> },
+    Block { slot: u64, blockhash: Option<[u8; 32]>, parent_slot: Option<u64>, rewards_len: u32, block_time_unix: Option<i64>, leader: Option<[u8; 32]> },
     Slot { slot: u64, parent: Option<u64>, status: u8 },
     EndOfStartup,
 }

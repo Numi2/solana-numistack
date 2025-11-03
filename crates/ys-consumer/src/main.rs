@@ -407,7 +407,7 @@ async fn main() -> Result<()> {
                 let rec = Record::Block(BlockMeta {
                     slot: b.slot,
                     blockhash: bh,
-                    parent_slot: if b.parent_slot > 0 { b.parent_slot - 1 } else { 0 },
+                    parent_slot: Some(b.parent_slot),
                     rewards_len: b.rewards.as_ref().map(|r| r.rewards.len()).unwrap_or(0) as u32,
                     block_time_unix: block_time,
                     leader: ld,

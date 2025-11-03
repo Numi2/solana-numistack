@@ -40,7 +40,7 @@ pub struct BlockMeta {
     pub slot: u64,
     #[serde(with = "serde_bytes")]
     pub blockhash: Option<[u8; 32]>,
-    pub parent_slot: u64,
+    pub parent_slot: Option<u64>,
     pub rewards_len: u32,
     pub block_time_unix: Option<i64>,
     #[serde(with = "serde_bytes")]

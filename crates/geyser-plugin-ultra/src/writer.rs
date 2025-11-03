@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use socket2::SockRef;
 #[cfg(target_os = "linux")]
 use nix::sched::{sched_setaffinity, CpuSet};
@@ -15,10 +16,11 @@ use nix::sched::{sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
 use libc;
+use tracing::{error, info};
 
 /// Writer thread: drains frames from the channel and writes to the UDS with minimal latency.
 /// NOTE: For best results pin this thread to an isolated CPU core (see comment below).
-pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, queue_depth_max: Arc<AtomicU64>) {
     // NOTE: For lowest tail latency in production, consider isolating the pinned core from the
     // general scheduler using kernel boot parameters, e.g. isolcpus=nohz,managed_irq,domain,1
     // and moving other background daemons off that core. This complements RT scheduling below.
@@ -27,13 +29,9 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
         if let Some(core) = cfg.pin_core {
             match CpuSet::new().and_then(|mut set| { set.set(core).map(|_| set) }) {
                 Ok(cpuset) => {
-                    if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpuset) {
-                        eprintln!("geyser-plugin-ultra: failed to set CPU affinity to core {core}: {e}");
-                    }
+                    if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpuset) { error!(target = "ultra.writer", "failed to set CPU affinity to core {core}: {e}"); }
                 }
-                Err(e) => {
-                    eprintln!("geyser-plugin-ultra: failed to build CPU set for core {core}: {e}");
-                }
+                Err(e) => { error!(target = "ultra.writer", "failed to build CPU set for core {core}: {e}"); }
             }
         }
         if let Some(prio) = cfg.rt_priority {
@@ -43,14 +41,14 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
             } else if policy_str.eq_ignore_ascii_case("fifo") {
                 libc::SCHED_FIFO
             } else {
-                eprintln!("geyser-plugin-ultra: unknown sched_policy '{policy_str}', falling back to FIFO");
+                error!(target = "ultra.writer", "unknown sched_policy '{policy_str}', falling back to FIFO");
                 libc::SCHED_FIFO
             };
             let param = libc::sched_param { sched_priority: prio };
             unsafe {
                 if libc::sched_setscheduler(0, policy, &param) != 0 {
                     let err = std::io::Error::last_os_error();
-                    eprintln!("geyser-plugin-ultra: failed to set RT scheduler ({policy_str}, prio {prio}): {err}");
+                    error!(target = "ultra.writer", "failed to set RT scheduler ({policy_str}, prio {prio}): {err}");
                 }
             }
         }
@@ -80,9 +78,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                 let _ = sockref.set_send_buffer_size(cfg.batch_bytes_max);
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 { let _ = sockref.set_nosigpipe(true); }
-                if let Ok(effective) = sockref.send_buffer_size() {
-                    eprintln!("geyser-plugin-ultra: send buffer size ~{} bytes", effective);
-                }
+                if let Ok(effective) = sockref.send_buffer_size() { info!(target = "ultra.writer", "send buffer size ~{} bytes", effective); }
                 // Batch & drain loop
                 let mut batch: Vec<PooledBuf> = Vec::with_capacity(cfg.batch_max);
                 loop {
@@ -143,10 +139,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                                         thread::sleep(Duration::from_millis(1));
                                         continue;
                                     }
-                                    Err(e) => {
-                                        eprintln!("geyser-plugin-ultra: write error: {e}");
-                                        break;
-                                    }
+                                    Err(e) => { error!(target = "ultra.writer", "write error: {e}"); break; }
                                 }
                             }
                             let elapsed = write_start.elapsed().as_nanos() as f64 / 1_000_000.0;
@@ -161,7 +154,16 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                                     histogram!("ultra_batch_ms").record(elapsed);
                                 }
                             });
-                            gauge!("ultra_channel_depth").set(rx.len() as f64);
+                            let ql = rx.len() as u64;
+                            gauge!("ultra_queue_len").set(ql as f64);
+                            // track max
+                            let mut cur = queue_depth_max.load(Ordering::Relaxed);
+                            while ql > cur {
+                                match queue_depth_max.compare_exchange(cur, ql, Ordering::Relaxed, Ordering::Relaxed) {
+                                    Ok(_) => break,
+                                    Err(actual) => cur = actual,
+                                }
+                            }
                             batch.clear();
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => { if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; } else { continue; } }
@@ -182,11 +184,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                 let should_log = last_connect_log.is_none()
                     || backoff != last_logged_backoff
                     || last_connect_log.map(|t| now.duration_since(t) >= Duration::from_secs(30)).unwrap_or(true);
-                if should_log {
-                    eprintln!("geyser-plugin-ultra: connect {} failed: {err} (backoff {:?})", cfg.socket_path.display(), backoff);
-                    last_connect_log = Some(now);
-                    last_logged_backoff = backoff;
-                }
+                if should_log { error!(target = "ultra.writer", "connect {} failed: {err} (backoff {:?})", cfg.socket_path.display(), backoff); last_connect_log = Some(now); last_logged_backoff = backoff; }
                 counter!("ultra_connect_errors_total").increment(1);
                 backoff_seq = backoff_seq.wrapping_add(1);
                 let jitter = std::cmp::min(Duration::from_millis((backoff_seq & 0x1F) as u64), backoff / 2);

@@ -271,12 +271,22 @@ async fn main() -> Result<()> {
             }
             Some(subscribe_update::UpdateOneof::Account(a)) => {
                 if let Some(acc) = &a.account {
+                    let pubkey = bs58::decode(&acc.pubkey)
+                        .into_vec()
+                        .ok()
+                        .and_then(|v| v.try_into().ok())
+                        .unwrap_or([0; 32]);
+                    let owner = bs58::decode(&acc.owner)
+                        .into_vec()
+                        .ok()
+                        .and_then(|v| v.try_into().ok())
+                        .unwrap_or([0; 32]);
                     let rec = Record::Account(AccountUpdate {
                         slot: a.slot,
                         is_startup: a.is_startup,
-                        pubkey: bs58::decode(&acc.pubkey).into_vec().unwrap_or_default().try_into().unwrap_or([0;32]),
+                        pubkey,
                         lamports: acc.lamports,
-                        owner: bs58::decode(&acc.owner).into_vec().unwrap_or_default().try_into().unwrap_or([0;32]),
+                        owner,
                         executable: acc.executable,
                         rent_epoch: acc.rent_epoch,
                         data: acc.data.clone(),
@@ -293,9 +303,7 @@ async fn main() -> Result<()> {
             Some(subscribe_update::UpdateOneof::Block(b)) => {
                 let bh = if !b.blockhash.is_empty() {
                     bs58::decode(&b.blockhash).into_vec().ok().and_then(|v| v.try_into().ok())
-                } else {
-                    None
-                };
+                } else { None };
                 // leader field not available in new proto version, set to None
                 let ld = None;
                 let block_time = b.block_time.as_ref().and_then(|ts| if ts.timestamp != 0 { Some(ts.timestamp) } else { None });

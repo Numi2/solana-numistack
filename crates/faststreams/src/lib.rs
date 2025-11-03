@@ -1,6 +1,7 @@
 // crates/faststreams/src/lib.rs
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
+use bincode::Options;
 use std::io::{self, Read, Write};
 use std::io::IoSlice;
 use smallvec::SmallVec;
@@ -84,10 +85,13 @@ impl EncodeOptions {
 }
 
 pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
     if opts.enable_compression {
         // Compress only when enabled and above threshold. This path incurs a payload allocation,
         // which is acceptable for throughput-oriented configurations.
-        let payload = bincode::serialize(rec)?;
+        let payload = bincode_opts.serialize(rec)?;
         let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
             let compressed = lz4_flex::block::compress_prepend_size(&payload);
             (FLAG_LZ4, compressed)
@@ -106,13 +110,13 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
     } else {
         // Low-latency path: avoid an intermediate payload allocation by sizing once and
         // serializing directly into the final buffer after writing the header.
-        let payload_len = bincode::serialized_size(rec)? as usize;
+        let payload_len = bincode_opts.serialized_size(rec)? as usize;
         let mut buf: Vec<u8> = Vec::with_capacity(4 + 2 + 2 + 4 + payload_len);
         buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
         buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
         buf.extend_from_slice(&0u16.to_be_bytes());
         buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        bincode::serialize_into(&mut buf, rec)?;
+        bincode_opts.serialize_into(&mut buf, rec)?;
         Ok(buf)
     }
 }
@@ -133,13 +137,16 @@ pub fn decode_record(mut src: impl Read) -> Result<Record, StreamError> {
     let len = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
     let mut body = vec![0u8; len];
     src.read_exact(&mut body)?;
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
     let payload = if (flags & FLAG_LZ4) != 0 {
         lz4_flex::block::decompress_size_prepended(&body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     } else {
         body
     };
-    Ok(bincode::deserialize::<Record>(&payload)?)
+    Ok(bincode_opts.deserialize::<Record>(&payload)?)
 }
 
 /// Decode without copying the body when uncompressed; returns (record, bytes_consumed).
@@ -159,18 +166,21 @@ pub fn decode_record_from_slice(src: &[u8], scratch: &mut Vec<u8>) -> Result<(Re
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }
     let body = &src[12..total];
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
     if (flags & FLAG_LZ4) != 0 {
         match lz4_flex::block::decompress_size_prepended(body) {
             Ok(decompressed) => {
                 scratch.clear();
                 scratch.extend_from_slice(&decompressed);
-                let rec = bincode::deserialize::<Record>(scratch)?;
+                let rec = bincode_opts.deserialize::<Record>(&scratch[..])?;
                 Ok((rec, total))
             }
             Err(e) => Err(StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))
         }
     } else {
-        let rec = bincode::deserialize::<Record>(body)?;
+        let rec = bincode_opts.deserialize::<Record>(body)?;
         Ok((rec, total))
     }
 }

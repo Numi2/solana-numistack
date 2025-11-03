@@ -107,22 +107,25 @@ impl JitoClient {
         };
         let packets = raw_txs
             .into_iter()
-            .map(|tx| Packet {
-                data: tx.clone(),
-                meta: Some(Meta {
-                    size: tx.len() as u64,
-                    addr: "".into(),
-                    port: 0,
-                    flags: Some(PacketFlags {
-                        discard: false,
-                        forwarded: false,
-                        repair: false,
-                        simple_vote_tx: false,
-                        tracer_packet: false,
-                        from_staked_node: true,
+            .map(|tx| {
+                let tx_len = tx.len() as u64;
+                Packet {
+                    data: tx,
+                    meta: Some(Meta {
+                        size: tx_len,
+                        addr: "".into(),
+                        port: 0,
+                        flags: Some(PacketFlags {
+                            discard: false,
+                            forwarded: false,
+                            repair: false,
+                            simple_vote_tx: false,
+                            tracer_packet: false,
+                            from_staked_node: true,
+                        }),
+                        sender_stake: 0,
                     }),
-                    sender_stake: 0,
-                }),
+                }
             })
             .collect::<Vec<_>>();
         Bundle { header: Some(header), packets }

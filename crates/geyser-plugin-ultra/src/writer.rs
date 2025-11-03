@@ -132,7 +132,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Ar
                             let write_start = Instant::now();
                             // Build borrowed slices for this batch
                             let mut slices: Vec<&[u8]> = Vec::with_capacity(batch.len());
-                            for b in &batch { slices.push(b.as_ref()); }
+                            for b in &batch { if let Some(s) = b.as_slice() { slices.push(s); } }
                             // Transient backpressure handling
                             loop {
                                 match write_all_vectored_slices(&mut stream, &slices) {

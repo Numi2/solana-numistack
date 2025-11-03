@@ -17,7 +17,7 @@ use std::io::Write;
 use serde::ser::{SerializeMap, Serializer};
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
+
 struct KafkaCfg {
     brokers: String,
     topic_accounts: String,

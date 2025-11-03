@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
+use metrics::{counter, gauge};
 
 /// Lock-free pool of reusable `Vec<u8>` buffers.
 #[derive(Debug)]
@@ -16,14 +17,27 @@ impl BufferPool {
 
     /// Get a pooled buffer wrapped in `PooledBuf`. The buffer is empty and ready to write.
     pub fn get(self: &Arc<Self>) -> PooledBuf {
-        let buf = self.q.pop().unwrap_or_else(|| Vec::with_capacity(self.default_capacity));
+        let buf = match self.q.pop() {
+            Some(b) => b,
+            None => {
+                counter!("ultra_pool_get_miss_total").increment(1);
+                Vec::with_capacity(self.default_capacity)
+            }
+        };
+        gauge!("ultra_pool_q_len").set(self.q.len() as f64);
         PooledBuf { inner: Some(buf), pool: Arc::clone(self) }
     }
 
     fn put(&self, mut buf: Vec<u8>) {
-        // Keep capacity; just clear contents for reuse.
+        // Replace excessively large buffers to prevent bloat under pressure.
+        if buf.capacity() > (self.default_capacity.saturating_mul(2)) {
+            buf = Vec::with_capacity(self.default_capacity);
+        }
         buf.clear();
-        let _ = self.q.push(buf);
+        if self.q.push(buf).is_err() {
+            counter!("ultra_pool_full_total").increment(1);
+        }
+        gauge!("ultra_pool_q_len").set(self.q.len() as f64);
     }
 }
 
@@ -36,19 +50,19 @@ pub struct PooledBuf {
 
 impl PooledBuf {
     #[inline]
-    pub fn inner_mut(&mut self) -> &mut Vec<u8> {
-        self.inner.as_mut().expect("pooled buffer already taken")
+    pub fn inner_mut(&mut self) -> Option<&mut Vec<u8>> {
+        if cfg!(debug_assertions) { debug_assert!(self.inner.is_some(), "pooled buffer already taken"); }
+        self.inner.as_mut()
     }
 
     #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        self.inner.as_ref().expect("pooled buffer already taken").as_slice()
+    pub fn as_slice(&self) -> Option<&[u8]> {
+        if cfg!(debug_assertions) { debug_assert!(self.inner.is_some(), "pooled buffer already taken"); }
+        self.inner.as_ref().map(|v| v.as_slice())
     }
 }
 
-impl AsRef<[u8]> for PooledBuf {
-    fn as_ref(&self) -> &[u8] { self.as_slice() }
-}
+// Intentionally omit AsRef<[u8]> to avoid accidental panics; callers must handle Option.
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {

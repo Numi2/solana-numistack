@@ -139,13 +139,15 @@ impl GeyserPlugin for Ultra {
         });
         if let Some(pool) = &self.pool {
             let mut pb = pool.get();
-            if encode_record_ref_into_with(&aref, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+            if let Some(buf) = pb.inner_mut() {
+                if encode_record_ref_into_with(&aref, buf, EncodeOptions::latency_uds()).is_ok() {
                 if tx.try_send(pb).is_err() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                     if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
                 } else {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                     if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                }
                 }
             }
         }
@@ -174,13 +176,15 @@ impl GeyserPlugin for Ultra {
         });
         if let Some(pool) = &self.pool {
             let mut pb = pool.get();
-            if encode_into_with(&rec, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+            if let Some(buf) = pb.inner_mut() {
+                if encode_into_with(&rec, buf, EncodeOptions::latency_uds()).is_ok() {
                 if tx.try_send(pb).is_err() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                     if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
                 } else {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                     if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                }
                 }
             }
         }
@@ -201,13 +205,15 @@ impl GeyserPlugin for Ultra {
             });
             if let Some(pool) = &self.pool {
                 let mut pb = pool.get();
-                if encode_into_with(&rec, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+                if let Some(buf) = pb.inner_mut() {
+                    if encode_into_with(&rec, buf, EncodeOptions::latency_uds()).is_ok() {
                     if tx.try_send(pb).is_err() {
                         let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                         if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
                     } else {
                         let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                         if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                    }
                     }
                 }
             }
@@ -230,13 +236,15 @@ impl GeyserPlugin for Ultra {
         let rec = Record::Slot { slot, parent, status: st };
         if let Some(pool) = &self.pool {
             let mut pb = pool.get();
-            if encode_into_with(&rec, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+            if let Some(buf) = pb.inner_mut() {
+                if encode_into_with(&rec, buf, EncodeOptions::latency_uds()).is_ok() {
                 if tx.try_send(pb).is_err() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                     if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
                 } else {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                     if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                }
                 }
             }
         }
@@ -247,8 +255,10 @@ impl GeyserPlugin for Ultra {
         let tx = match &self.tx { Some(t) => t, None => return Ok(()), };
         if let Some(pool) = &self.pool {
             let mut pb = pool.get();
-            if encode_into_with(&Record::EndOfStartup, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+            if let Some(buf) = pb.inner_mut() {
+                if encode_into_with(&Record::EndOfStartup, buf, EncodeOptions::latency_uds()).is_ok() {
                 let _ = tx.try_send(pb);
+                }
             }
         }
         Ok(())

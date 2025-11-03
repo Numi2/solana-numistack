@@ -7,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
+use socket2::SockRef;
 
 pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let mut backoff = Duration::from_millis(50);
@@ -23,6 +24,9 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
             Ok(mut stream) => {
                 stream.set_nonblocking(false).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                // Best-effort: increase send buffer to accommodate large batches
+                let sockref = SockRef::from(&stream);
+                let _ = sockref.set_send_buffer_size(cfg.batch_bytes_max);
                 // Batch & drain loop
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cfg.batch_max);
                 loop {
@@ -30,11 +34,13 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
                         break;
                     }
                     // blocking recv
-                    match rx.recv_timeout(Duration::from_millis(5)) {
+                    match rx.recv_timeout(Duration::from_millis(1)) {
                         Ok(first) => {
                             let mut size = first.len();
                             batch.push(first);
+                            let start = Instant::now();
                             while batch.len() < cfg.batch_max && size < cfg.batch_bytes_max {
+                                if start.elapsed() >= Duration::from_millis(cfg.flush_after_ms) { break; }
                                 match rx.try_recv() {
                                     Ok(m) => {
                                         size += m.len();

@@ -2,11 +2,11 @@
 #![forbid(unsafe_code)]
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver};
-use faststreams::{encode_record, write_all_vectored, Record, TxUpdate, AccountUpdate, BlockMeta};
+use faststreams::{encode_record_with, EncodeOptions, write_all_vectored, Record, TxUpdate, AccountUpdate, BlockMeta};
 use futures::{SinkExt, StreamExt};
 use std::os::unix::net::UnixStream;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use yellowstone_grpc_client::GeyserGrpcClient;
@@ -30,14 +30,18 @@ fn writer_loop(uds_path: String, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Ar
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
         match uds_connect(&uds_path) {
             Ok(mut stream) => {
+                // Best-effort: enlarge send buffer
+                let _ = socket2::SockRef::from(&stream).set_send_buffer_size(batch_bytes_max);
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_max);
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                    match rx.recv_timeout(Duration::from_millis(5)) {
+                    match rx.recv_timeout(Duration::from_millis(1)) {
                         Ok(first) => {
                             let mut size = first.len();
                             batch.push(first);
+                            let start = Instant::now();
                             while batch.len() < batch_max && size < batch_bytes_max {
+                                if start.elapsed() >= Duration::from_millis(2) { break; }
                                 match rx.try_recv() {
                                     Ok(m) => { size += m.len(); if size > batch_bytes_max { break; } batch.push(m); }
                                     Err(_) => break,
@@ -140,7 +144,7 @@ async fn main() -> Result<()> {
                     err: t.transaction.as_ref().and_then(|tx| tx.meta.as_ref()).and_then(|m| m.err.as_ref().cloned()).map(|e| format!("{:?}", e)),
                     vote: false, // is_vote not available in new structure
                 });
-                if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
+                if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) { let _ = txq.try_send(buf); }
             }
             Some(subscribe_update::UpdateOneof::Account(a)) => {
                 if let Some(acc) = &a.account {
@@ -154,7 +158,7 @@ async fn main() -> Result<()> {
                         rent_epoch: acc.rent_epoch,
                         data: acc.data.clone(),
                     });
-                    if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
+                    if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) { let _ = txq.try_send(buf); }
                 }
             }
             Some(subscribe_update::UpdateOneof::Block(b)) => {
@@ -174,11 +178,11 @@ async fn main() -> Result<()> {
                     block_time_unix: block_time,
                     leader: ld,
                 });
-                if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
+                if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) { let _ = txq.try_send(buf); }
             }
             Some(subscribe_update::UpdateOneof::Slot(s)) => {
                 let rec = Record::Slot { slot: s.slot, parent: s.parent, status: s.status as u8 };
-                if let Ok(buf) = encode_record(&rec) { let _ = txq.try_send(buf); }
+                if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) { let _ = txq.try_send(buf); }
             }
             _ => {}
         }

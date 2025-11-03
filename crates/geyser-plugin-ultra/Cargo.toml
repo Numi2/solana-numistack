@@ -19,6 +19,7 @@ tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 faststreams = { path = "../faststreams" }
 log = "0.4.28"
+socket2 = { version = "0.5.7", features = ["all"] }
 # Agave Geyser interface with latest versions
 agave-geyser-plugin-interface = "3.0.8"
 solana-transaction-status = "3.0.8"

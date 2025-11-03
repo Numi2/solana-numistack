@@ -4,7 +4,7 @@ mod writer;
 
 use config::{Config, Streams};
 use crossbeam_channel::{bounded, Sender};
-use faststreams::{encode_record, AccountUpdate, BlockMeta, Record, TxUpdate};
+use faststreams::{encode_record_with, EncodeOptions, AccountUpdate, BlockMeta, Record, TxUpdate};
 use metrics::{counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::Mutex;
@@ -121,7 +121,7 @@ impl GeyserPlugin for Ultra {
             rent_epoch,
             data: data.to_vec(),
         });
-        if let Ok(buf) = encode_record(&rec) {
+        if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
             if tx.try_send(buf).is_err() {
                 counter!("ultra_dropped_total", "kind" => "account").increment(1);
             } else {
@@ -151,7 +151,7 @@ impl GeyserPlugin for Ultra {
             err: err_opt,
             vote: is_vote,
         });
-        if let Ok(buf) = encode_record(&rec) {
+        if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
             if tx.try_send(buf).is_err() {
                 counter!("ultra_dropped_total", "kind" => "tx").increment(1);
             } else {
@@ -173,7 +173,7 @@ impl GeyserPlugin for Ultra {
                 block_time_unix: b.block_time,
                 leader: None, // Leader info not available in new API
             });
-            if let Ok(buf) = encode_record(&rec) {
+            if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
                 if tx.try_send(buf).is_err() {
                     counter!("ultra_dropped_total", "kind" => "block").increment(1);
                 } else {
@@ -197,7 +197,7 @@ impl GeyserPlugin for Ultra {
             SlotStatus::Dead(_) => 6,
         };
         let rec = Record::Slot { slot, parent, status: st };
-        if let Ok(buf) = encode_record(&rec) {
+        if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
             if tx.try_send(buf).is_err() {
                 counter!("ultra_dropped_total", "kind" => "slot").increment(1);
             } else {
@@ -209,7 +209,7 @@ impl GeyserPlugin for Ultra {
 
     fn notify_end_of_startup(&self) -> GeyserResult<()> {
         let tx = match &self.tx { Some(t) => t, None => return Ok(()), };
-        if let Ok(buf) = encode_record(&Record::EndOfStartup) {
+        if let Ok(buf) = encode_record_with(&Record::EndOfStartup, EncodeOptions::latency_uds()) {
             let _ = tx.try_send(buf);
         }
         Ok(())

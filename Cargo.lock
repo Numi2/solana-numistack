@@ -963,6 +963,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
 ]
 
@@ -1188,6 +1189,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "solana-sdk",
  "solana-transaction-status",
  "thiserror 1.0.69",
@@ -4620,6 +4622,7 @@ dependencies = [
  "rdkafka",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5015,6 +5018,7 @@ dependencies = [
  "crossbeam-channel",
  "faststreams",
  "futures",
+ "socket2 0.5.10",
  "tokio",
  "tonic 0.12.3",
  "tracing",

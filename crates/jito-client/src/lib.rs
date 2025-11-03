@@ -15,7 +15,7 @@ use jito::packet::{Meta, Packet, PacketFlags};
 use jito::searcher::searcher_service_client::SearcherServiceClient;
 use jito::searcher::{GetTipAccountsRequest, SendBundleRequest};
 use prost_types::Timestamp;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tonic::transport::{Channel, ClientTlsConfig};
 
 #[derive(Clone)]
@@ -27,6 +27,9 @@ impl JitoClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let channel = Channel::from_shared(endpoint.to_string())?
             .tls_config(ClientTlsConfig::new())?
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(Duration::from_secs(1))
+            .keep_alive_while_idle(true)
             .connect()
             .await?;
         Ok(Self { inner: SearcherServiceClient::new(channel) })
@@ -35,6 +38,9 @@ impl JitoClient {
     pub async fn connect_with_bearer(endpoint: &str, _bearer: &str) -> Result<Self> {
         let channel = Channel::from_shared(endpoint.to_string())?
             .tls_config(ClientTlsConfig::new())?
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(Duration::from_secs(1))
+            .keep_alive_while_idle(true)
             .connect()
             .await?;
         let client = Self { inner: SearcherServiceClient::new(channel) };

@@ -17,3 +17,4 @@ yellowstone-grpc-client = { version = "10.1.1", default-features = false }
 crossbeam-channel = { workspace = true }
 bs58 = "0.5.1"
 tonic = "0.12"
+socket2 = { version = "0.5.7", features = ["all"] }

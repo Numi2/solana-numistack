@@ -3,8 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::io::IoSlice;
+use smallvec::SmallVec;
 
 const COMPRESS_THRESHOLD: usize = 2048;
+const IOV_MAX_DEFAULT: usize = 1024; // typical on Linux/macOS
 const FLAG_LZ4: u16 = 0x0001;
 
 pub const FRAME_MAGIC: u32 = 0x4653_5452; // 'FSTR'
@@ -65,10 +67,25 @@ pub enum StreamError {
     BadHeader,
 }
 
-pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {
+#[derive(Clone, Copy, Debug)]
+pub struct EncodeOptions {
+    pub enable_compression: bool,
+    pub compress_threshold: usize,
+}
+
+impl EncodeOptions {
+    pub fn default_throughput() -> Self {
+        Self { enable_compression: true, compress_threshold: COMPRESS_THRESHOLD }
+    }
+    pub fn latency_uds() -> Self {
+        // Disable compression for low-latency local sockets
+        Self { enable_compression: false, compress_threshold: usize::MAX }
+    }
+}
+
+pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
     let payload = bincode::serialize(rec)?;
-    let (flags, body): (u16, Vec<u8>) = if payload.len() >= COMPRESS_THRESHOLD {
-        // use lz4 with size prepended to enable single-buffer decode
+    let (flags, body): (u16, Vec<u8>) = if opts.enable_compression && payload.len() >= opts.compress_threshold {
         let compressed = lz4_flex::block::compress_prepend_size(&payload);
         (FLAG_LZ4, compressed)
     } else {
@@ -83,6 +100,10 @@ pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {
     buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
     buf.extend_from_slice(&body);
     Ok(buf)
+}
+
+pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {
+    encode_record_with(rec, EncodeOptions::default_throughput())
 }
 
 pub fn decode_record(mut src: impl Read) -> Result<Record, StreamError> {
@@ -103,54 +124,80 @@ pub fn decode_record(mut src: impl Read) -> Result<Record, StreamError> {
     } else {
         body
     };
-    Ok(bincode::deserialize::<Record>(&payload).map_err(|e| e)?)
+    Ok(bincode::deserialize::<Record>(&payload)?)
+}
+
+/// Decode without copying the body when uncompressed; returns (record, bytes_consumed).
+pub fn decode_record_from_slice(src: &[u8], scratch: &mut Vec<u8>) -> Result<(Record, usize), StreamError> {
+    if src.len() < 12 {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    let magic = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+    let ver = u16::from_be_bytes([src[4], src[5]]);
+    if magic != FRAME_MAGIC || ver != FRAME_VERSION {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = u16::from_be_bytes([src[6], src[7]]);
+    let len = u32::from_be_bytes([src[8], src[9], src[10], src[11]]) as usize;
+    let total = 12 + len;
+    if src.len() < total {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    let body = &src[12..total];
+    if (flags & FLAG_LZ4) != 0 {
+        match lz4_flex::block::decompress_size_prepended(body) {
+            Ok(decompressed) => {
+                scratch.clear();
+                scratch.extend_from_slice(&decompressed);
+                let rec = bincode::deserialize::<Record>(scratch)?;
+                Ok((rec, total))
+            }
+            Err(e) => Err(StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))
+        }
+    } else {
+        let rec = bincode::deserialize::<Record>(body)?;
+        Ok((rec, total))
+    }
 }
 
 pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result<()> {
-    // Build IoSlice array over immutable frame data
-    let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(&f[..])).collect();
-    let mut offset = 0usize;
-    let total_slices = slices.len();
-    while offset < total_slices {
-        let n = dst.write_vectored(&slices[offset..])?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+    let mut frame_idx: usize = 0;
+    let mut first_offset: usize = 0; // byte offset inside frames[frame_idx]
+    let iov_max = IOV_MAX_DEFAULT;
+
+    while frame_idx < frames.len() {
+        let mut iovecs: SmallVec<[IoSlice<'_>; 256]> = SmallVec::new();
+        let mut added = 0usize;
+        let mut idx = frame_idx;
+        while idx < frames.len() && added < iov_max {
+            if idx == frame_idx && first_offset != 0 {
+                let s = &frames[idx][first_offset..];
+                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+            } else {
+                let s = &frames[idx];
+                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+            }
+            added += 1;
+            idx += 1;
         }
 
-        // Advance IoSlice array by the number of bytes written
+        let n = dst.write_vectored(&iovecs)?;
+        if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+
         let mut remaining = n;
-        while remaining > 0 && offset < slices.len() {
-            let current_len = slices[offset].len();
-            if remaining >= current_len {
-                remaining -= current_len;
-                offset += 1;
+        while remaining > 0 {
+            let slice_len = if first_offset != 0 {
+                frames[frame_idx].len() - first_offset
             } else {
-                // For partial writes, we need to adjust the slice
-                // This is complex due to borrow checker, so let's use a simpler approach
-                // Create new slices starting from the partial position
-                let start_offset = offset;
-                let mut new_slices = Vec::new();
-
-                // Copy fully consumed slices
-                for i in 0..start_offset {
-                    new_slices.push(slices[i]);
-                }
-
-                // Handle the partially consumed slice
-                if start_offset < slices.len() {
-                    let original_data = frames[start_offset].as_slice();
-                    let consumed = frames[start_offset].len() - slices[start_offset].len() + remaining;
-                    let remaining_data = &original_data[consumed..];
-                    new_slices.push(IoSlice::new(remaining_data));
-
-                    // Copy remaining slices
-                    for i in (start_offset + 1)..slices.len() {
-                        new_slices.push(slices[i]);
-                    }
-                }
-
-                slices = new_slices;
-                offset = start_offset;
+                frames[frame_idx].len()
+            };
+            if remaining >= slice_len {
+                remaining -= slice_len;
+                frame_idx += 1;
+                first_offset = 0;
+                if frame_idx >= frames.len() { break; }
+            } else {
+                first_offset += remaining;
                 remaining = 0;
             }
         }

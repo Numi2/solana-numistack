@@ -4,6 +4,8 @@
     "socket_path": "/var/run/ultra-geyser.sock",
     "queue_capacity": 262144,
     "batch_max": 4096,
+  "batch_bytes_max": 4194304,
+  "flush_after_ms": 2,
     "streams": { "accounts": true, "transactions": true, "blocks": true, "slots": true },
     "metrics": { "listen_addr": "0.0.0.0:9977" }
   }

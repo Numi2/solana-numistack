@@ -1,7 +1,7 @@
 // crates/ultra-aggregator/src/main.rs
 #![forbid(unsafe_code)]
 use anyhow::Result;
-use faststreams::{Record};
+use faststreams::{Record, decode_record_from_slice};
 use bytes::{Buf, BytesMut};
 use metrics::{counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -11,7 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use bs58;
+use socket2::SockRef;
 
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
@@ -162,6 +162,10 @@ async fn main() -> Result<()> {
                 break;
             }
             Ok((sock, _)) = listener.accept() => {
+                // Best-effort: enlarge recv buffer on accepted socket
+                #[cfg(unix)] {
+                    let _ = SockRef::from(&sock).set_recv_buffer_size(4 * 1024 * 1024);
+                }
                 let cfg_clone = cfg.clone();
                 #[cfg(feature = "kafka")] {
                     let ks = kafka_sink.clone();
@@ -186,6 +190,7 @@ async fn main() -> Result<()> {
 
 async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")] ks: Option<KafkaSink>) -> Result<()> {
     let mut buf = BytesMut::with_capacity(1 << 20);
+    let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
         // read available bytes directly into the growable buffer
         let n = sock.read_buf(&mut buf).await?;
@@ -193,31 +198,27 @@ async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")]
 
         // Try to peel records out
         loop {
-            let mut cursor = std::io::Cursor::new(&buf[..]);
-            let pos = cursor.position() as usize;
-            match faststreams::decode_record(&mut cursor) {
-                Ok(rec) => {
-                    if cfg.stdout_json {
-                        // Render as JSON with human-friendly base58 for byte arrays
-                        println!("{}", serde_json::to_string(&json_view(&rec))?);
-                    }
+            match decode_record_from_slice(&buf[..], &mut scratch) {
+                Ok(rec_and_len) => {
+                    let (rec, consumed) = rec_and_len;
+                    if cfg.stdout_json { println!("{}", serde_json::to_string(&json_view(&rec))?); }
                     counter!("ultra_records_ingested_total").increment(1);
                     #[cfg(feature = "kafka")]
                     if let Some(k) = &ks { k.try_send(rec); }
-                    let consumed = cursor.position() as usize;
                     buf.advance(consumed);
                 }
                 Err(faststreams::StreamError::BadHeader) => {
-                    // desync; drop up to pos+1
-                    let drop_to = pos.saturating_add(1);
-                    buf.advance(drop_to);
+                    // scan for next magic to resync
+                    let magic = faststreams::FRAME_MAGIC.to_be_bytes();
+                    if let Some(idx) = buf[..].windows(4).position(|w| w == magic) {
+                        if idx > 0 { buf.advance(idx); }
+                    } else {
+                        buf.clear();
+                    }
                     break;
                 }
+                Err(faststreams::StreamError::De(_)) => break, // need more bytes
                 Err(faststreams::StreamError::Io(_)) => break,
-                Err(faststreams::StreamError::De(_)) => {
-                    // not enough bytes for payload, wait for more
-                    break;
-                }
                 Err(faststreams::StreamError::Ser(_)) => break,
             }
         }

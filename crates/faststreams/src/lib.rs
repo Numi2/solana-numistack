@@ -56,6 +56,25 @@ pub enum Record {
     EndOfStartup,
 }
 
+// Borrowing variants for zero-copy encoding on producers
+#[derive(Debug, Serialize)]
+pub struct AccountUpdateRef<'a> {
+    pub slot: u64,
+    pub is_startup: bool,
+    pub pubkey: [u8; 32],
+    pub lamports: u64,
+    pub owner: [u8; 32],
+    pub executable: bool,
+    pub rent_epoch: u64,
+    #[serde(with = "serde_bytes")]
+    pub data: &'a [u8],
+}
+
+#[derive(Debug, Serialize)]
+pub enum RecordRef<'a> {
+    Account(AccountUpdateRef<'a>),
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum StreamError {
     #[error("io: {0}")]
@@ -105,7 +124,7 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
         };
 
         // header: magic(4) | version(2) | flags(2) | len(4)
-        let mut buf: Vec<u8> = Vec::with_capacity(4 + 2 + 2 + 4 + body.len());
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + body.len());
         buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
         buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
         buf.extend_from_slice(&flags.to_be_bytes());
@@ -116,13 +135,77 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
         // Low-latency path: avoid an intermediate payload allocation by sizing once and
         // serializing directly into the final buffer after writing the header.
         let payload_len = bincode_opts.serialized_size(rec)? as usize;
-        let mut buf: Vec<u8> = Vec::with_capacity(4 + 2 + 2 + 4 + payload_len);
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + payload_len);
         buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
         buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
         buf.extend_from_slice(&0u16.to_be_bytes());
         buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
         bincode_opts.serialize_into(&mut buf, rec)?;
         Ok(buf)
+    }
+}
+
+/// Encode a borrowed record (e.g. `RecordRef::Account`) avoiding intermediate copies.
+pub fn encode_record_ref_with(rec: &RecordRef<'_>, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
+    if opts.enable_compression {
+        let payload = bincode_opts.serialize(rec)?;
+        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
+            let compressed = lz4_flex::block::compress_prepend_size(&payload);
+            (FLAG_LZ4, compressed)
+        } else {
+            (0, payload)
+        };
+
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + body.len());
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        Ok(buf)
+    } else {
+        let payload_len = bincode_opts.serialized_size(rec)? as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + payload_len);
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        bincode_opts.serialize_into(&mut buf, rec)?;
+        Ok(buf)
+    }
+}
+
+/// Encode a borrowed record directly into the provided buffer, avoiding an intermediate allocation.
+pub fn encode_record_ref_into_with(rec: &RecordRef<'_>, buf: &mut Vec<u8>, opts: EncodeOptions) -> Result<(), StreamError> {
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
+    buf.clear();
+    if opts.enable_compression {
+        let payload = bincode_opts.serialize(rec)?;
+        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
+            let compressed = lz4_flex::block::compress_prepend_size(&payload);
+            (FLAG_LZ4, compressed)
+        } else { (0, payload) };
+        buf.reserve(12 + body.len());
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+        Ok(())
+    } else {
+        let payload_len = bincode_opts.serialized_size(rec)? as usize;
+        buf.reserve(12 + payload_len);
+        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        bincode_opts.serialize_into(buf, rec)?;
+        Ok(())
     }
 }
 
@@ -141,7 +224,7 @@ pub fn encode_into_with(rec: &Record, buf: &mut Vec<u8>, opts: EncodeOptions) ->
         } else {
             (0, payload)
         };
-        buf.reserve(4 + 2 + 2 + 4 + body.len());
+        buf.reserve(12 + body.len());
         buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
         buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
         buf.extend_from_slice(&flags.to_be_bytes());
@@ -150,7 +233,7 @@ pub fn encode_into_with(rec: &Record, buf: &mut Vec<u8>, opts: EncodeOptions) ->
         Ok(())
     } else {
         let payload_len = bincode_opts.serialized_size(rec)? as usize;
-        buf.reserve(4 + 2 + 2 + 4 + payload_len);
+        buf.reserve(12 + payload_len);
         buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
         buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
         buf.extend_from_slice(&0u16.to_be_bytes());
@@ -210,9 +293,9 @@ pub fn decode_record_from_slice(src: &[u8], scratch: &mut Vec<u8>) -> Result<(Re
         .allow_trailing_bytes();
     if (flags & FLAG_LZ4) != 0 {
         match lz4_flex::block::decompress_size_prepended(body) {
-            Ok(decompressed) => {
-                scratch.clear();
-                scratch.extend_from_slice(&decompressed);
+            Ok(mut decompressed) => {
+                // Move decompressed buffer into scratch to avoid a copy
+                std::mem::swap(scratch, &mut decompressed);
                 let rec = bincode_opts.deserialize::<Record>(&scratch[..])?;
                 Ok((rec, total))
             }
@@ -225,6 +308,8 @@ pub fn decode_record_from_slice(src: &[u8], scratch: &mut Vec<u8>) -> Result<(Re
 }
 
 pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result<()> {
+    // NOTE: We currently map each frame to one IoSlice. For tiny frames, we could coalesce
+    // adjacent frames into larger IoSlices to reduce syscall overhead.
     let mut frame_idx: usize = 0;
     let mut first_offset: usize = 0; // byte offset inside frames[frame_idx]
     let iov_max = IOV_MAX_DEFAULT;
@@ -251,19 +336,26 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
         if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
 
         let mut remaining = n;
-        while remaining > 0 {
-            let slice_len = if first_offset != 0 {
-                frames[frame_idx].len() - first_offset
-            } else {
-                frames[frame_idx].len()
-            };
+        if remaining == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+        if first_offset != 0 {
+            let slice_len = frames[frame_idx].len() - first_offset;
             if remaining >= slice_len {
                 remaining -= slice_len;
                 frame_idx += 1;
                 first_offset = 0;
-                if frame_idx >= frames.len() { break; }
             } else {
                 first_offset += remaining;
+                continue;
+            }
+        }
+        while remaining > 0 {
+            if frame_idx >= frames.len() { break; }
+            let slice_len = frames[frame_idx].len();
+            if remaining >= slice_len {
+                remaining -= slice_len;
+                frame_idx += 1;
+            } else {
+                first_offset = remaining;
                 remaining = 0;
             }
         }
@@ -299,22 +391,31 @@ pub fn write_all_vectored_slices(mut dst: impl Write, frames: &[&[u8]]) -> io::R
         if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
 
         let mut remaining = n;
-        while remaining > 0 {
-            let slice_len = if first_offset != 0 {
-                frames[frame_idx].len() - first_offset
-            } else {
-                frames[frame_idx].len()
-            };
+        if remaining == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+        if first_offset != 0 {
+            let slice_len = frames[frame_idx].len() - first_offset;
             if remaining >= slice_len {
                 remaining -= slice_len;
                 frame_idx += 1;
                 first_offset = 0;
-                if frame_idx >= frames.len() { break; }
             } else {
                 first_offset += remaining;
+                continue;
+            }
+        }
+        while remaining > 0 {
+            if frame_idx >= frames.len() { break; }
+            let slice_len = frames[frame_idx].len();
+            if remaining >= slice_len {
+                remaining -= slice_len;
+                frame_idx += 1;
+            } else {
+                first_offset = remaining;
                 remaining = 0;
             }
         }
     }
     Ok(())
 }
+
+// (intentionally left empty)

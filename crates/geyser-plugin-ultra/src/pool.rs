@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crossbeam_queue::ArrayQueue;
 
 /// Lock-free pool of reusable `Vec<u8>` buffers.
+#[derive(Debug)]
 pub struct BufferPool {
     q: ArrayQueue<Vec<u8>>,
     default_capacity: usize,
@@ -15,7 +16,7 @@ impl BufferPool {
 
     /// Get a pooled buffer wrapped in `PooledBuf`. The buffer is empty and ready to write.
     pub fn get(self: &Arc<Self>) -> PooledBuf {
-        let buf = self.q.pop().unwrap_or_else(|_| Vec::with_capacity(self.default_capacity));
+        let buf = self.q.pop().unwrap_or_else(|| Vec::with_capacity(self.default_capacity));
         PooledBuf { inner: Some(buf), pool: Arc::clone(self) }
     }
 
@@ -27,6 +28,7 @@ impl BufferPool {
 }
 
 /// An owned buffer that returns to its originating pool on drop.
+#[derive(Debug)]
 pub struct PooledBuf {
     inner: Option<Vec<u8>>, // set to None when taken
     pool: Arc<BufferPool>,
@@ -42,9 +44,6 @@ impl PooledBuf {
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_ref().expect("pooled buffer already taken").as_slice()
     }
-
-    #[inline]
-    pub fn len(&self) -> usize { self.as_slice().len() }
 }
 
 impl AsRef<[u8]> for PooledBuf {

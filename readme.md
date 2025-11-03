@@ -1,8 +1,8 @@
 low latency solana data and execution stack
 
-geyser-plugin-ultra: in-process validator plugin that emits account, tx, block, and slot updates
+geyser-plugin-ultra: in-process validator plugin that emits account, transaction, block, and slot updates.
 
-ultra-aggregator: local daemon that accepts the stream over a Unix domain socket fans out
+ultra-aggregator: local daemon that accepts the stream over a Unix domain socket and fans out to consumers.
 
 ys-consumer: client for a remote Yellowstone gRPC endpoint if you do not run a validator.
 

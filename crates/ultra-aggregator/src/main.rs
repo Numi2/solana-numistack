@@ -12,8 +12,9 @@ use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use socket2::SockRef;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::io::Write;
+use serde::ser::{SerializeMap, Serializer};
 
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
@@ -33,6 +34,8 @@ struct Cfg {
     metrics_addr: Option<String>,
     // Optional tuning knob: requested socket recv buffer size
     uds_recv_buf_bytes: Option<usize>,
+    // Optional safety bound: drop frames larger than this many bytes to avoid OOM
+    max_frame_bytes: Option<usize>,
     #[cfg(feature = "kafka")]
     kafka: Option<KafkaCfg>,
 }
@@ -98,8 +101,7 @@ impl JsonSink {
             let mut w = std::io::LineWriter::new(stdout.lock());
             while let Some(evt) = rx.blocking_recv() {
                 gauge!("ultra_json_queue_depth").set(rx.len() as f64);
-                let v = json_value_from_event(&evt);
-                if serde_json::to_writer(&mut w, &v).is_ok() {
+                if write_json_event(&evt, &mut w).is_ok() {
                     let _ = w.write_all(b"\n");
                 }
             }
@@ -112,11 +114,9 @@ impl JsonSink {
     }
 }
 
-thread_local! {
-    static INGEST_SEQ: Cell<u64> = Cell::new(0);
-}
-const INGEST_SAMPLE_MASK: u64 = 0xF; // sample 1/16
-const INGEST_SAMPLE_WEIGHT: u64 = 16;
+static INGEST_SEQ: AtomicU64 = AtomicU64::new(0);
+const INGEST_SAMPLE_MASK: u64 = 0xFF; // sample ~1/256
+const INGEST_SAMPLE_WEIGHT: u64 = 256;
 
 #[derive(Clone, Debug)]
 enum JsonEvent {
@@ -146,42 +146,57 @@ fn json_event_from_record(rec: &Record) -> JsonEvent {
     }
 }
 
-fn json_value_from_event(evt: &JsonEvent) -> serde_json::Value {
+// removed json_value_from_event: replaced with write_json_event for direct serialization
+
+fn write_json_event<W: Write>(evt: &JsonEvent, w: &mut W) -> serde_json::Result<()> {
+    let mut ser = serde_json::Serializer::new(w);
     match evt {
-        JsonEvent::Account { slot, is_startup, pubkey, lamports, owner, executable, rent_epoch, data_len } => serde_json::json!({
-            "type": "account",
-            "slot": slot,
-            "is_startup": is_startup,
-            "pubkey": bs58::encode(pubkey).into_string(),
-            "lamports": lamports,
-            "owner": bs58::encode(owner).into_string(),
-            "executable": executable,
-            "rent_epoch": rent_epoch,
-            "data_len": data_len,
-        }),
-        JsonEvent::Tx { slot, signature, err, vote } => serde_json::json!({
-            "type": "tx",
-            "slot": slot,
-            "signature": bs58::encode(signature).into_string(),
-            "err": err,
-            "vote": vote,
-        }),
-        JsonEvent::Block { slot, blockhash, parent_slot, rewards_len, block_time_unix, leader } => serde_json::json!({
-            "type": "block",
-            "slot": slot,
-            "blockhash": blockhash.map(|h| bs58::encode(h).into_string()),
-            "parent_slot": parent_slot,
-            "rewards_len": rewards_len,
-            "block_time_unix": block_time_unix,
-            "leader": leader.map(|l| bs58::encode(l).into_string()),
-        }),
-        JsonEvent::Slot { slot, parent, status } => serde_json::json!({
-            "type": "slot",
-            "slot": slot,
-            "parent": parent,
-            "status": status,
-        }),
-        JsonEvent::EndOfStartup => serde_json::json!({"type": "end_of_startup"}),
+        JsonEvent::Account { slot, is_startup, pubkey, lamports, owner, executable, rent_epoch, data_len } => {
+            let mut m = ser.serialize_map(Some(9))?;
+            m.serialize_entry("type", "account")?;
+            m.serialize_entry("slot", slot)?;
+            m.serialize_entry("is_startup", is_startup)?;
+            m.serialize_entry("pubkey", &bs58::encode(pubkey).into_string())?;
+            m.serialize_entry("lamports", lamports)?;
+            m.serialize_entry("owner", &bs58::encode(owner).into_string())?;
+            m.serialize_entry("executable", executable)?;
+            m.serialize_entry("rent_epoch", rent_epoch)?;
+            m.serialize_entry("data_len", data_len)?;
+            m.end()
+        }
+        JsonEvent::Tx { slot, signature, err, vote } => {
+            let mut m = ser.serialize_map(Some(5))?;
+            m.serialize_entry("type", "tx")?;
+            m.serialize_entry("slot", slot)?;
+            m.serialize_entry("signature", &bs58::encode(signature).into_string())?;
+            m.serialize_entry("err", err)?;
+            m.serialize_entry("vote", vote)?;
+            m.end()
+        }
+        JsonEvent::Block { slot, blockhash, parent_slot, rewards_len, block_time_unix, leader } => {
+            let mut m = ser.serialize_map(Some(7))?;
+            m.serialize_entry("type", "block")?;
+            m.serialize_entry("slot", slot)?;
+            m.serialize_entry("blockhash", &blockhash.map(|h| bs58::encode(h).into_string()))?;
+            m.serialize_entry("parent_slot", parent_slot)?;
+            m.serialize_entry("rewards_len", rewards_len)?;
+            m.serialize_entry("block_time_unix", block_time_unix)?;
+            m.serialize_entry("leader", &leader.map(|l| bs58::encode(l).into_string()))?;
+            m.end()
+        }
+        JsonEvent::Slot { slot, parent, status } => {
+            let mut m = ser.serialize_map(Some(4))?;
+            m.serialize_entry("type", "slot")?;
+            m.serialize_entry("slot", slot)?;
+            m.serialize_entry("parent", parent)?;
+            m.serialize_entry("status", status)?;
+            m.end()
+        }
+        JsonEvent::EndOfStartup => {
+            let mut m = ser.serialize_map(Some(1))?;
+            m.serialize_entry("type", "end_of_startup")?;
+            m.end()
+        }
     }
 }
 
@@ -244,15 +259,17 @@ async fn main() -> Result<()> {
                 let json_clone = json_sink.clone();
                 #[cfg(feature = "kafka")] {
                     let ks = kafka_sink.clone();
+                    let max_frame_bytes = cfg.max_frame_bytes.unwrap_or(16 * 1024 * 1024);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(sock, json_clone, ks).await {
+                        if let Err(e) = handle_client(sock, json_clone, max_frame_bytes, ks).await {
                             error!("client error: {e:?}");
                         }
                     });
                 }
                 #[cfg(not(feature = "kafka"))] {
+                    let max_frame_bytes = cfg.max_frame_bytes.unwrap_or(16 * 1024 * 1024);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(sock, json_clone).await {
+                        if let Err(e) = handle_client(sock, json_clone, max_frame_bytes).await {
                             error!("client error: {e:?}");
                         }
                     });
@@ -263,7 +280,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, #[cfg(feature = "kafka")] ks: Option<KafkaSink>) -> Result<()> {
+async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, max_frame_bytes: usize, #[cfg(feature = "kafka")] ks: Option<KafkaSink>) -> Result<()> {
     let mut buf = BytesMut::with_capacity(1 << 20);
     let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
@@ -273,6 +290,33 @@ async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, #[cfg(featu
 
         // Try to peel records out
         loop {
+            // Safety pre-check: if header present and declared frame size is excessive, resync
+            if buf.len() >= 12 {
+                let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let ver = u16::from_be_bytes([buf[4], buf[5]]);
+                if magic != faststreams::FRAME_MAGIC || ver != faststreams::FRAME_VERSION {
+                    counter!("ultra_decode_bad_header_total").increment(1);
+                    let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
+                    if let Some(idx) = memchr::memmem::find(&buf[..], &magic_bytes) {
+                        if idx > 0 { buf.advance(idx); }
+                    } else {
+                        buf.clear();
+                    }
+                    break;
+                }
+                let len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+                if len > max_frame_bytes {
+                    counter!("ultra_frame_too_large_total").increment(1);
+                    // Resync by searching for the next magic after the current one to avoid re-parsing the same header
+                    let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
+                    if let Some(rel) = memchr::memmem::find(&buf[4..], &magic_bytes) {
+                        buf.advance(rel + 4);
+                    } else {
+                        buf.clear();
+                    }
+                    break;
+                }
+            }
             match decode_record_from_slice(&buf[..], &mut scratch) {
                 Ok(rec_and_len) => {
                     let (rec, consumed) = rec_and_len;
@@ -282,13 +326,10 @@ async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, #[cfg(featu
                             counter!("ultra_json_dropped_total").increment(1);
                         }
                     }
-                    INGEST_SEQ.with(|seq| {
-                        let v = seq.get();
-                        seq.set(v.wrapping_add(1));
-                        if (v & INGEST_SAMPLE_MASK) == 0 {
-                            counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
-                        }
-                    });
+                    let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
+                    if (v & INGEST_SAMPLE_MASK) == 0 {
+                        counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
+                    }
                     #[cfg(feature = "kafka")]
                     if let Some(k) = &ks { k.try_send(rec); }
                     buf.advance(consumed);
@@ -297,7 +338,7 @@ async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, #[cfg(featu
                     counter!("ultra_decode_bad_header_total").increment(1);
                     // scan for next magic to resync
                     let magic = faststreams::FRAME_MAGIC.to_be_bytes();
-                    if let Some(idx) = buf[..].windows(4).position(|w| w == magic) {
+                    if let Some(idx) = memchr::memmem::find(&buf[..], &magic) {
                         if idx > 0 { buf.advance(idx); }
                     } else {
                         buf.clear();

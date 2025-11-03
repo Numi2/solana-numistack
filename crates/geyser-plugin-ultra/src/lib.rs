@@ -1,10 +1,11 @@
-#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 mod config;
 mod writer;
+mod pool;
 
-use config::{Config, Streams};
+use config::{Config, ValidatedConfig, Streams};
 use crossbeam_channel::{bounded, Sender};
-use faststreams::{encode_record_with, EncodeOptions, AccountUpdate, BlockMeta, Record, TxUpdate};
+use faststreams::{encode_into_with, encode_record_ref_into_with, EncodeOptions, AccountUpdateRef, BlockMeta, Record, RecordRef, TxUpdate};
 use metrics::{counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::Mutex;
@@ -12,21 +13,23 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
     ReplicaTransactionInfoVersions, Result as GeyserResult, SlotStatus,
 };
-use solana_sdk::{pubkey::Pubkey, bs58};
+use solana_sdk::{bs58};
 use std::fs::File;
 use std::io::Read;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 #[derive(Debug)]
 struct Ultra {
-    cfg: Option<Config>,
-    tx: Option<Sender<Vec<u8>>>,
+    cfg: Option<ValidatedConfig>,
+    tx: Option<Sender<pool::PooledBuf>>,
     shutdown: Arc<AtomicBool>,
     streams: Streams,
     logger_set: Mutex<bool>,
+    pool: Option<Arc<pool::BufferPool>>,
+    metrics_seq: AtomicU64,
 }
 
 impl Ultra {
@@ -37,6 +40,8 @@ impl Ultra {
             shutdown: Arc::new(AtomicBool::new(false)),
             streams: Streams { accounts: true, transactions: true, blocks: true, slots: true },
             logger_set: Mutex::new(false),
+            pool: None,
+            metrics_seq: AtomicU64::new(0),
         }
     }
 }
@@ -63,7 +68,8 @@ impl GeyserPlugin for Ultra {
         let mut f = File::open(config_file).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
         let mut s = String::new();
         f.read_to_string(&mut s).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
-        let cfg: Config = serde_json::from_str(&s).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+        let cfg_raw: Config = serde_json::from_str(&s).map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+        let cfg = cfg_raw.validate().map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
 
         // Metrics
         if let Some(m) = &cfg.metrics {
@@ -75,7 +81,10 @@ impl GeyserPlugin for Ultra {
             }
         }
 
-        let (tx, rx) = bounded::<Vec<u8>>(cfg.queue_capacity);
+        // Initialize reusable buffer pool sized for bursts
+        let pool_default_cap = cfg.pool_default_cap;
+        let pool = pool::BufferPool::new(cfg.pool_items_max, pool_default_cap);
+        let (tx, rx) = bounded::<pool::PooledBuf>(cfg.queue_capacity);
 
         // Writer thread
         let wcfg = cfg.clone();
@@ -87,6 +96,7 @@ impl GeyserPlugin for Ultra {
         self.streams = cfg.streams.clone();
         self.tx = Some(tx);
         self.cfg = Some(cfg);
+        self.pool = Some(pool);
 
         Ok(())
     }
@@ -109,23 +119,34 @@ impl GeyserPlugin for Ultra {
             ),
             _ => return Ok(()),
         };
-        let try_pk = Pubkey::try_from(pubkey).ok();
-        let try_owner = Pubkey::try_from(owner).ok();
-        let rec = Record::Account(AccountUpdate {
+        let pk_bytes = {
+            let s: &[u8] = AsRef::<[u8]>::as_ref(&pubkey);
+            if s.len() == 32 { let mut a = [0u8;32]; a.copy_from_slice(s); a } else { [0u8;32] }
+        };
+        let owner_bytes = {
+            let s: &[u8] = AsRef::<[u8]>::as_ref(&owner);
+            if s.len() == 32 { let mut a = [0u8;32]; a.copy_from_slice(s); a } else { [0u8;32] }
+        };
+        let aref = RecordRef::Account(AccountUpdateRef {
             slot,
             is_startup,
-            pubkey: try_pk.map(|p| p.to_bytes()).unwrap_or([0;32]),
+            pubkey: pk_bytes,
             lamports,
-            owner: try_owner.map(|p| p.to_bytes()).unwrap_or([0;32]),
+            owner: owner_bytes,
             executable,
             rent_epoch,
-            data: data.to_vec(),
+            data,
         });
-        if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
-            if tx.try_send(buf).is_err() {
-                counter!("ultra_dropped_total", "kind" => "account").increment(1);
-            } else {
-                counter!("ultra_enqueued_total", "kind" => "account").increment(1);
+        if let Some(pool) = &self.pool {
+            let mut pb = pool.get();
+            if encode_record_ref_into_with(&aref, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+                if tx.try_send(pb).is_err() {
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
+                } else {
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                }
             }
         }
         Ok(())
@@ -151,11 +172,16 @@ impl GeyserPlugin for Ultra {
             err: err_opt,
             vote: is_vote,
         });
-        if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
-            if tx.try_send(buf).is_err() {
-                counter!("ultra_dropped_total", "kind" => "tx").increment(1);
-            } else {
-                counter!("ultra_enqueued_total", "kind" => "tx").increment(1);
+        if let Some(pool) = &self.pool {
+            let mut pb = pool.get();
+            if encode_into_with(&rec, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+                if tx.try_send(pb).is_err() {
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
+                } else {
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                }
             }
         }
         Ok(())
@@ -173,11 +199,16 @@ impl GeyserPlugin for Ultra {
                 block_time_unix: b.block_time,
                 leader: None, // Leader info not available in new API
             });
-            if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
-                if tx.try_send(buf).is_err() {
-                    counter!("ultra_dropped_total", "kind" => "block").increment(1);
-                } else {
-                    counter!("ultra_enqueued_total", "kind" => "block").increment(1);
+            if let Some(pool) = &self.pool {
+                let mut pb = pool.get();
+                if encode_into_with(&rec, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+                    if tx.try_send(pb).is_err() {
+                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                        if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
+                    } else {
+                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                        if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                    }
                 }
             }
         }
@@ -197,11 +228,16 @@ impl GeyserPlugin for Ultra {
             SlotStatus::Dead(_) => 6,
         };
         let rec = Record::Slot { slot, parent, status: st };
-        if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
-            if tx.try_send(buf).is_err() {
-                counter!("ultra_dropped_total", "kind" => "slot").increment(1);
-            } else {
-                counter!("ultra_enqueued_total", "kind" => "slot").increment(1);
+        if let Some(pool) = &self.pool {
+            let mut pb = pool.get();
+            if encode_into_with(&rec, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+                if tx.try_send(pb).is_err() {
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    if (v & 0xFF) == 0 { counter!("ultra_dropped_total").increment(256); }
+                } else {
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    if (v & 0xFF) == 0 { counter!("ultra_enqueued_total").increment(256); }
+                }
             }
         }
         Ok(())
@@ -209,8 +245,11 @@ impl GeyserPlugin for Ultra {
 
     fn notify_end_of_startup(&self) -> GeyserResult<()> {
         let tx = match &self.tx { Some(t) => t, None => return Ok(()), };
-        if let Ok(buf) = encode_record_with(&Record::EndOfStartup, EncodeOptions::latency_uds()) {
-            let _ = tx.try_send(buf);
+        if let Some(pool) = &self.pool {
+            let mut pb = pool.get();
+            if encode_into_with(&Record::EndOfStartup, pb.inner_mut(), EncodeOptions::latency_uds()).is_ok() {
+                let _ = tx.try_send(pb);
+            }
         }
         Ok(())
     }

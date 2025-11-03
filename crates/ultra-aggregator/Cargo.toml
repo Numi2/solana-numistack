@@ -20,6 +20,7 @@ metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
 bs58 = "0.5.1"
 socket2 = { version = "0.5.7", features = ["all"] }
+memchr = "2"
 
 # optional sink
 rdkafka = { version = "0.36.2", optional = true, default-features = false, features = ["cmake-build"] }

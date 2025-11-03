@@ -1,0 +1,5 @@
+cargo:rerun-if-changed=proto/bundle.proto
+cargo:rerun-if-changed=proto/packet.proto
+cargo:rerun-if-changed=proto/shared.proto
+cargo:rerun-if-changed=proto/searcher.proto
+cargo:rerun-if-changed=proto

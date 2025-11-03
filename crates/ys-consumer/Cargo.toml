@@ -21,3 +21,4 @@ tonic = "0.12"
 socket2 = { version = "0.5.7", features = ["all"] }
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
+event-listener = "5"

@@ -3,14 +3,16 @@
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver};
 use crossbeam_queue::ArrayQueue;
-use faststreams::{encode_record_with, EncodeOptions, write_all_vectored, Record, TxUpdate, AccountUpdate, BlockMeta};
+use faststreams::{encode_into_with, encode_record_ref_into_with, EncodeOptions, write_all_vectored, Record, TxUpdate, AccountUpdateRef, BlockMeta, RecordRef};
 use futures::{SinkExt, StreamExt};
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
-use metrics::{counter, gauge};
+use event_listener::{Event, Listener};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::{error, info};
+use tokio::signal;
 use tracing_subscriber::EnvFilter;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use std::collections::HashMap;
@@ -27,7 +29,85 @@ fn uds_connect(path: &str) -> std::io::Result<UnixStream> {
     Ok(s)
 }
 
-fn writer_loop(uds_path: String, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, batch_max: usize, batch_bytes_max: usize, flush_interval: Duration) {
+trait BatchSource {
+    fn blocking_pop(&self, flush_interval: Duration) -> Option<Vec<u8>>;
+    fn try_pop(&self) -> Option<Vec<u8>>;
+}
+
+impl BatchSource for Receiver<Vec<u8>> {
+    #[inline]
+    fn blocking_pop(&self, _flush_interval: Duration) -> Option<Vec<u8>> {
+        // Use fully blocking recv for first item to avoid artificial latency.
+        match self.recv() {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        }
+    }
+    #[inline]
+    fn try_pop(&self) -> Option<Vec<u8>> { self.try_recv().ok() }
+}
+
+// Lightweight buffer pool to reuse Vec<u8> allocations in the fast path.
+#[derive(Debug)]
+struct BufPool {
+    q: ArrayQueue<Vec<u8>>,
+    default_capacity: usize,
+}
+
+impl BufPool {
+    fn new(max_items: usize, default_capacity: usize) -> Self {
+        Self { q: ArrayQueue::new(max_items), default_capacity }
+    }
+    fn get(&self) -> Vec<u8> {
+        self.q.pop().unwrap_or_else(|| Vec::with_capacity(self.default_capacity))
+    }
+    fn put(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        let _ = self.q.push(buf);
+    }
+}
+
+// Event-driven SPSC queue wrapper: producers notify, consumer blocks on event.
+#[derive(Clone)]
+struct SpscSender {
+    q: std::sync::Arc<ArrayQueue<Vec<u8>>>,
+    ev: std::sync::Arc<Event>,
+}
+
+impl SpscSender {
+    fn push(&self, v: Vec<u8>) -> Result<(), Vec<u8>> {
+        match self.q.push(v) {
+            Ok(()) => {
+                self.ev.notify(1);
+                Ok(())
+            }
+            Err(v) => Err(v),
+        }
+    }
+    fn len(&self) -> usize { self.q.len() }
+}
+
+struct SpscQueue {
+    q: std::sync::Arc<ArrayQueue<Vec<u8>>>,
+    ev: std::sync::Arc<Event>,
+}
+
+impl BatchSource for SpscQueue {
+    #[inline]
+    fn blocking_pop(&self, flush_interval: Duration) -> Option<Vec<u8>> {
+        // Double-checked wait with timeout to support flush cadence.
+        loop {
+            if let Some(v) = self.q.pop() { return Some(v); }
+            let listener = self.ev.listen();
+            if let Some(v) = self.q.pop() { return Some(v); }
+            let _ = listener.wait_timeout(flush_interval);
+        }
+    }
+    #[inline]
+    fn try_pop(&self) -> Option<Vec<u8>> { self.q.pop() }
+}
+
+fn writer_loop_generic<S: BatchSource>(uds_path: String, src: S, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, batch_max: usize, batch_bytes_max: usize, flush_interval: Duration, buf_pool: std::sync::Arc<BufPool>) {
     let mut backoff = Duration::from_millis(50);
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
@@ -38,77 +118,32 @@ fn writer_loop(uds_path: String, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Ar
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_max);
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                    match rx.recv_timeout(flush_interval) {
-                        Ok(first) => {
-                            let mut size = first.len();
-                            batch.push(first);
-                            let start = Instant::now();
-                            while batch.len() < batch_max && size < batch_bytes_max {
-                                if start.elapsed() >= flush_interval { break; }
-                                match rx.try_recv() {
-                                    Ok(m) => { size += m.len(); if size > batch_bytes_max { break; } batch.push(m); }
-                                    Err(_) => break,
-                                }
-                            }
-                            if let Err(e) = write_all_vectored(&mut stream, &batch) {
-                                eprintln!("ys-consumer: write error: {e}");
-                                break;
-                            }
-                            batch.clear();
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-                thread::sleep(Duration::from_millis(100));
-                backoff = Duration::from_millis(50);
-            }
-            Err(err) => {
-                eprintln!("ys-consumer: connect {} failed: {err}", uds_path);
-                thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(2));
-                continue;
-            }
-        }
-    }
-}
-
-fn writer_loop_spsc(uds_path: String, q: std::sync::Arc<ArrayQueue<Vec<u8>>>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, batch_max: usize, batch_bytes_max: usize, flush_interval: Duration) {
-    let mut backoff = Duration::from_millis(50);
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
-        match uds_connect(&uds_path) {
-            Ok(mut stream) => {
-                let _ = socket2::SockRef::from(&stream).set_send_buffer_size(batch_bytes_max);
-                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_max);
-                loop {
-                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                    match q.pop() {
-                        Some(first) => {
-                            let mut size = first.len();
-                            batch.push(first);
-                            let start = Instant::now();
-                            while batch.len() < batch_max && size < batch_bytes_max {
-                                if start.elapsed() >= flush_interval { break; }
-                                if let Some(m) = q.pop() {
-                                    size += m.len();
-                                    if size > batch_bytes_max { break; }
-                                    batch.push(m);
-                                } else {
-                                    break;
-                                }
-                            }
-                            if let Err(e) = write_all_vectored(&mut stream, &batch) {
-                                eprintln!("ys-consumer: write error: {e}");
-                                break;
-                            }
-                            batch.clear();
-                        }
-                        None => {
-                            thread::sleep(flush_interval);
-                            continue;
+                    // Blocking wait for first frame (no artificial timeout)
+                    let first = match src.blocking_pop(flush_interval) { Some(v) => v, None => break };
+                    let mut size = first.len();
+                    batch.push(first);
+                    let start = Instant::now();
+                    while batch.len() < batch_max && size < batch_bytes_max {
+                        if start.elapsed() >= flush_interval { break; }
+                        if let Some(m) = src.try_pop() {
+                            size += m.len();
+                            if size > batch_bytes_max { break; }
+                            batch.push(m);
+                        } else {
+                            break;
                         }
                     }
+                    // pre-metrics for the batch
+                    let batch_frames = batch.len();
+                    let batch_bytes: usize = batch.iter().map(|b| b.len()).sum();
+                    if let Err(e) = write_all_vectored(&mut stream, &batch) {
+                        eprintln!("ys-consumer: write error: {e}");
+                        break;
+                    }
+                    counter!("ys_consumer_write_batches_total").increment(1);
+                    counter!("ys_consumer_write_bytes_total").increment(batch_bytes as u64);
+                    histogram!("ys_consumer_write_batch_frames").record(batch_frames as f64);
+                    for b in batch.drain(..) { buf_pool.put(b); }
                 }
                 thread::sleep(Duration::from_millis(100));
                 backoff = Duration::from_millis(50);
@@ -138,13 +173,7 @@ async fn main() -> Result<()> {
         let _ = PrometheusBuilder::new().with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap()).install();
     }
 
-    let mut builder = GeyserGrpcClient::build_from_static(Box::leak(endpoint.into_boxed_str()));
-    if let Some(tok) = x_token {
-        builder = builder.x_token(Some(tok))?;
-    }
-    let mut client = builder.connect().await?;
-
-    let (mut tx, mut rx) = client.subscribe().await?;
+    let endpoint_static = Box::leak(endpoint.into_boxed_str());
     fn env_bool(name: &str, default: bool) -> bool {
         match std::env::var(name) {
             Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "y"),
@@ -188,37 +217,52 @@ async fn main() -> Result<()> {
         ping: Some(SubscribeRequestPing { id: 0 }),
         ..Default::default()
     };
-    tx.send(req).await?;
+    let backoff_min = Duration::from_millis(env_u64("YS_BACKOFF_MIN_MS", 250));
+    let backoff_max = Duration::from_millis(env_u64("YS_BACKOFF_MAX_MS", 10_000));
+    let idle_timeout = Duration::from_millis(env_u64("YS_IDLE_TIMEOUT_MS", 3_000));
+    let mut reconnect_backoff = backoff_min;
 
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let queue_cap = env_usize("YS_QUEUE_CAP", 65_536);
     let batch_max = env_usize("YS_BATCH_MAX", 1024);
     let batch_bytes_max = env_usize("YS_BATCH_BYTES_MAX", 2 * 1024 * 1024);
-    let flush_interval = Duration::from_millis(env_u64("YS_FLUSH_INTERVAL_MS", 1));
+    // Ensure non-zero flush interval to avoid busy-wait in SPSC mode when queue is empty.
+    let flush_interval_ms = env_u64("YS_FLUSH_INTERVAL_MS", 1);
+    let flush_interval = Duration::from_millis(std::cmp::max(1, flush_interval_ms));
     let use_spsc = env_bool("YS_SPSC", false);
 
+    // Buffer pool config
+    let buf_pool_cap = env_usize("YS_BUF_POOL_CAP", queue_cap);
+    let buf_default_cap = env_usize("YS_BUF_DEFAULT_CAP", 4096);
+    let buf_pool = std::sync::Arc::new(BufPool::new(buf_pool_cap, buf_default_cap));
+
     // queue and writer
-    let (txq_opt, spsc_q_opt) = if use_spsc {
-        (None, Some(std::sync::Arc::new(ArrayQueue::<Vec<u8>>::new(queue_cap))))
+    let mut txq_opt: Option<crossbeam_channel::Sender<Vec<u8>>> = None;
+    let mut spsc_send_opt: Option<SpscSender> = None;
+    if use_spsc {
+        let inner_q = std::sync::Arc::new(ArrayQueue::<Vec<u8>>::new(queue_cap));
+        let ev = std::sync::Arc::new(Event::new());
+        spsc_send_opt = Some(SpscSender { q: inner_q.clone(), ev: ev.clone() });
+        let uds_path_clone = uds_path.clone();
+        let sd = shutdown.clone();
+        let src = SpscQueue { q: inner_q, ev };
+        let pool = buf_pool.clone();
+        thread::Builder::new().name("ys-writer".into()).spawn(move || {
+            writer_loop_generic(uds_path_clone, src, &sd, batch_max, batch_bytes_max, flush_interval, pool);
+        })?;
     } else {
         let (txq, rxq) = bounded::<Vec<u8>>(queue_cap);
         let uds_path_clone = uds_path.clone();
         let sd = shutdown.clone();
+        let pool = buf_pool.clone();
         thread::Builder::new().name("ys-writer".into()).spawn(move || {
-            writer_loop(uds_path_clone, rxq, &sd, batch_max, batch_bytes_max, flush_interval);
+            writer_loop_generic(uds_path_clone, rxq, &sd, batch_max, batch_bytes_max, flush_interval, pool);
         })?;
-        (Some(txq), None)
-    };
-
-    if let Some(q) = &spsc_q_opt {
-        let uds_path_clone = uds_path.clone();
-        let sd = shutdown.clone();
-        let q_clone = q.clone();
-        thread::Builder::new().name("ys-writer".into()).spawn(move || {
-            writer_loop_spsc(uds_path_clone, q_clone, &sd, batch_max, batch_bytes_max, flush_interval);
-        })?;
+        txq_opt = Some(txq);
     }
-    info!("connected to Yellowstone; forwarding to {}", uds_path);
+
+    // writer spawned above in both branches
+    // info is logged after a successful subscribe in the loop below
 
     // metrics: queue depth sampler
     if metrics_addr.is_some() {
@@ -232,21 +276,56 @@ async fn main() -> Result<()> {
                 }
             });
         }
-        if let Some(q) = &spsc_q_opt {
-            let q = q.clone();
+        if let Some(s) = &spsc_send_opt {
+            let s = s.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(250));
                 loop {
                     tick.tick().await;
-                    gauge!("ys_consumer_queue_depth").set(q.len() as f64);
+                    gauge!("ys_consumer_queue_depth").set(s.len() as f64);
                 }
             });
         }
     }
 
-    while let Some(upd) = rx.next().await {
-        let upd = match upd { Ok(u) => u, Err(e) => { error!("stream error: {e}"); break; } };
-        match upd.update_oneof {
+    // Simple time-based jitter without external RNG
+    fn jitter(d: Duration) -> Duration {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let base_ms = d.as_millis() as u64;
+        if base_ms <= 1 { return d; }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_millis(0));
+        let r = (now.as_nanos() as u64) ^ (base_ms.rotate_left(13));
+        let half = base_ms / 2;
+        let jitter_ms = half + (r % (half.max(1)));
+        Duration::from_millis(jitter_ms.max(1))
+    }
+
+    let shutdown_sig = signal::ctrl_c();
+    tokio::pin!(shutdown_sig);
+
+    'outer: loop {
+        // connect + subscribe (with shutdown support)
+        let mut builder = GeyserGrpcClient::build_from_static(endpoint_static);
+        if let Some(tok) = x_token.clone() {
+            builder = match builder.x_token(Some(tok)) { Ok(b) => b, Err(e) => { error!("token set error: {e}"); tokio::time::sleep(reconnect_backoff).await; continue; } };
+        }
+        let mut client = match builder.connect().await { Ok(c) => c, Err(e) => { error!("connect error: {e}"); counter!("ys_connect_fail_total").increment(1); tokio::time::sleep(jitter(reconnect_backoff)).await; reconnect_backoff = (reconnect_backoff * 2).min(backoff_max); continue; } };
+        let (mut tx, mut rx) = match client.subscribe().await { Ok(sr) => sr, Err(e) => { error!("subscribe error: {e}"); counter!("ys_subscribe_fail_total").increment(1); tokio::time::sleep(jitter(reconnect_backoff)).await; reconnect_backoff = (reconnect_backoff * 2).min(backoff_max); continue; } };
+        if let Err(e) = tx.send(req.clone()).await { error!("send subscribe request failed: {e}"); counter!("ys_send_fail_total").increment(1); tokio::time::sleep(jitter(reconnect_backoff)).await; reconnect_backoff = (reconnect_backoff * 2).min(backoff_max); continue; }
+        reconnect_backoff = backoff_min;
+        info!("connected to Yellowstone; forwarding to {}", uds_path);
+
+        loop {
+            let next_fut = rx.next();
+            let idle_timer = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle_timer);
+            tokio::select! {
+                _ = &mut shutdown_sig => { info!("shutting down"); break 'outer; }
+                _ = &mut idle_timer => { counter!("ys_idle_timeouts_total").increment(1); error!("idle timeout (no updates for {:?})", idle_timeout); break; }
+                res = next_fut => {
+                    match res {
+                        Some(Ok(upd)) => {
+                            match upd.update_oneof {
             Some(subscribe_update::UpdateOneof::Transaction(t)) => {
                 let mut sig = [0u8; 64];
                 // Extract signature from transaction if available
@@ -261,16 +340,27 @@ async fn main() -> Result<()> {
                     err: t.transaction.as_ref().and_then(|tx| tx.meta.as_ref()).and_then(|m| m.err.as_ref().cloned()).map(|e| format!("{:?}", e)),
                     vote: false, // is_vote not available in new structure
                 });
-                if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
+                let mut buf = buf_pool.get();
+                let t0 = Instant::now();
+                if encode_into_with(&rec, &mut buf, EncodeOptions::latency_uds()).is_ok() {
+                    histogram!("ys_consumer_encode_us", "kind" => "tx").record(t0.elapsed().as_secs_f64() * 1e6);
                     if let Some(txq) = &txq_opt {
-                        if txq.try_send(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
-                    } else if let Some(q) = &spsc_q_opt {
-                        if q.push(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
+                        match txq.try_send(buf) {
+                            Ok(()) => {}
+                            Err(e) => { counter!("ys_consumer_dropped_total").increment(1); let buf = e.into_inner(); buf_pool.put(buf); }
+                        }
+                    } else if let Some(s) = &spsc_send_opt {
+                        match s.push(buf) { Ok(()) => {}, Err(buf) => { counter!("ys_consumer_dropped_total").increment(1); buf_pool.put(buf); } }
+                    } else {
+                        buf_pool.put(buf);
                     }
+                } else {
+                    buf_pool.put(buf);
                 }
             }
             Some(subscribe_update::UpdateOneof::Account(a)) => {
                 if let Some(acc) = &a.account {
+                    // Decode base58 into fixed arrays
                     let pubkey = bs58::decode(&acc.pubkey)
                         .into_vec()
                         .ok()
@@ -281,7 +371,7 @@ async fn main() -> Result<()> {
                         .ok()
                         .and_then(|v| v.try_into().ok())
                         .unwrap_or([0; 32]);
-                    let rec = Record::Account(AccountUpdate {
+                    let aref = RecordRef::Account(AccountUpdateRef {
                         slot: a.slot,
                         is_startup: a.is_startup,
                         pubkey,
@@ -289,14 +379,21 @@ async fn main() -> Result<()> {
                         owner,
                         executable: acc.executable,
                         rent_epoch: acc.rent_epoch,
-                        data: acc.data.clone(),
+                        data: &acc.data,
                     });
-                    if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
+                    let mut buf = buf_pool.get();
+                    let t0 = Instant::now();
+                    if encode_record_ref_into_with(&aref, &mut buf, EncodeOptions::latency_uds()).is_ok() {
+                        histogram!("ys_consumer_encode_us", "kind" => "account").record(t0.elapsed().as_secs_f64() * 1e6);
                         if let Some(txq) = &txq_opt {
-                            if txq.try_send(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
-                        } else if let Some(q) = &spsc_q_opt {
-                            if q.push(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
+                            match txq.try_send(buf) { Ok(()) => {}, Err(e) => { counter!("ys_consumer_dropped_total").increment(1); let buf = e.into_inner(); buf_pool.put(buf); } }
+                        } else if let Some(s) = &spsc_send_opt {
+                            match s.push(buf) { Ok(()) => {}, Err(buf) => { counter!("ys_consumer_dropped_total").increment(1); buf_pool.put(buf); } }
+                        } else {
+                            buf_pool.put(buf);
                         }
+                    } else {
+                        buf_pool.put(buf);
                     }
                 }
             }
@@ -315,26 +412,50 @@ async fn main() -> Result<()> {
                     block_time_unix: block_time,
                     leader: ld,
                 });
-                if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
+                let mut buf = buf_pool.get();
+                let t0 = Instant::now();
+                if encode_into_with(&rec, &mut buf, EncodeOptions::latency_uds()).is_ok() {
+                    histogram!("ys_consumer_encode_us", "kind" => "block").record(t0.elapsed().as_secs_f64() * 1e6);
                     if let Some(txq) = &txq_opt {
-                        if txq.try_send(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
-                    } else if let Some(q) = &spsc_q_opt {
-                        if q.push(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
+                        match txq.try_send(buf) { Ok(()) => {}, Err(e) => { counter!("ys_consumer_dropped_total").increment(1); let buf = e.into_inner(); buf_pool.put(buf); } }
+                    } else if let Some(s) = &spsc_send_opt {
+                        match s.push(buf) { Ok(()) => {}, Err(buf) => { counter!("ys_consumer_dropped_total").increment(1); buf_pool.put(buf); } }
+                    } else {
+                        buf_pool.put(buf);
                     }
+                } else {
+                    buf_pool.put(buf);
                 }
             }
             Some(subscribe_update::UpdateOneof::Slot(s)) => {
                 let rec = Record::Slot { slot: s.slot, parent: s.parent, status: s.status as u8 };
-                if let Ok(buf) = encode_record_with(&rec, EncodeOptions::latency_uds()) {
+                let mut buf = buf_pool.get();
+                let t0 = Instant::now();
+                if encode_into_with(&rec, &mut buf, EncodeOptions::latency_uds()).is_ok() {
+                    histogram!("ys_consumer_encode_us", "kind" => "slot").record(t0.elapsed().as_secs_f64() * 1e6);
                     if let Some(txq) = &txq_opt {
-                        if txq.try_send(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
-                    } else if let Some(q) = &spsc_q_opt {
-                        if q.push(buf).is_err() { counter!("ys_consumer_dropped_total").increment(1); }
+                        match txq.try_send(buf) { Ok(()) => {}, Err(e) => { counter!("ys_consumer_dropped_total").increment(1); let buf = e.into_inner(); buf_pool.put(buf); } }
+                    } else if let Some(s) = &spsc_send_opt {
+                        match s.push(buf) { Ok(()) => {}, Err(buf) => { counter!("ys_consumer_dropped_total").increment(1); buf_pool.put(buf); } }
+                    } else {
+                        buf_pool.put(buf);
                     }
+                } else {
+                    buf_pool.put(buf);
                 }
             }
             _ => {}
+                            }
+                        }
+                        Some(Err(e)) => { error!("stream error: {e}"); break; }
+                        None => { error!("stream closed by server"); break; }
+                    }
+                }
+            }
         }
+        counter!("ys_reconnects_total").increment(1);
+        tokio::time::sleep(jitter(reconnect_backoff)).await;
+        reconnect_backoff = (reconnect_backoff * 2).min(backoff_max);
     }
     Ok(())
 }

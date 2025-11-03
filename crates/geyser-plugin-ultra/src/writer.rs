@@ -1,11 +1,11 @@
 // crates/geyser-plugin-ultra/src/writer.rs
-use crate::Config;
+use crate::config::ValidatedConfig as Config;
+use crate::pool::PooledBuf;
 use crossbeam_channel::Receiver;
-use faststreams::write_all_vectored;
-use metrics::{counter, histogram};
+use faststreams::write_all_vectored_slices;
+use metrics::{counter, histogram, gauge};
 use std::cell::Cell;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use socket2::SockRef;
@@ -16,11 +16,16 @@ use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
 use libc;
 
-pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+/// Writer thread: drains frames from the channel and writes to the UDS with minimal latency.
+/// NOTE: For best results pin this thread to an isolated CPU core (see comment below).
+pub fn run_writer(cfg: Config, rx: Receiver<PooledBuf>, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    // NOTE: For lowest tail latency in production, consider isolating the pinned core from the
+    // general scheduler using kernel boot parameters, e.g. isolcpus=nohz,managed_irq,domain,1
+    // and moving other background daemons off that core. This complements RT scheduling below.
     #[cfg(target_os = "linux")]
     {
         if let Some(core) = cfg.pin_core {
-            match CpuSet::new().and_then(|mut set| { let _ = set.set(core); Ok(set) }) {
+            match CpuSet::new().and_then(|mut set| { set.set(core).map(|_| set) }) {
                 Ok(cpuset) => {
                     if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpuset) {
                         eprintln!("geyser-plugin-ultra: failed to set CPU affinity to core {core}: {e}");
@@ -33,7 +38,14 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
         }
         if let Some(prio) = cfg.rt_priority {
             let policy_str = cfg.sched_policy.as_deref().unwrap_or("fifo");
-            let policy = if policy_str.eq_ignore_ascii_case("rr") { libc::SCHED_RR } else { libc::SCHED_FIFO };
+            let policy = if policy_str.eq_ignore_ascii_case("rr") {
+                libc::SCHED_RR
+            } else if policy_str.eq_ignore_ascii_case("fifo") {
+                libc::SCHED_FIFO
+            } else {
+                eprintln!("geyser-plugin-ultra: unknown sched_policy '{policy_str}', falling back to FIFO");
+                libc::SCHED_FIFO
+            };
             let param = libc::sched_param { sched_priority: prio };
             unsafe {
                 if libc::sched_setscheduler(0, policy, &param) != 0 {
@@ -46,75 +58,141 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
     thread_local! {
         static HISTO_SEQ: Cell<u64> = const { Cell::new(0) };
     }
-    const HISTO_SAMPLE_MASK: u64 = 0xF; // sample 1/16
+    // Histogram sampling mask: (2^log2 - 1). Default ~1/256.
+    let histo_mask: u64 = (1u64 << (cfg.histogram_sample_log2 as u32)) - 1;
     let mut backoff = Duration::from_millis(50);
+    let mut backoff_seq: u64 = 0;
+    let mut last_connect_log: Option<Instant> = None;
+    let mut last_logged_backoff: Duration = Duration::from_millis(0);
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        // Ensure stale socket path is gone
-        if Path::new(&cfg.socket_path).exists() {
-            // If it's a socket created by server, we just connect; no unlink here.
-        }
 
+        counter!("ultra_connect_attempts_total").increment(1);
         match UnixStream::connect(&cfg.socket_path) {
             Ok(mut stream) => {
+                counter!("ultra_connect_success_total").increment(1);
                 stream.set_nonblocking(false).ok();
-                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                stream.set_write_timeout(Some(Duration::from_millis(cfg.write_timeout_ms))).ok();
                 // Best-effort: increase send buffer to accommodate large batches
                 let sockref = SockRef::from(&stream);
                 let _ = sockref.set_send_buffer_size(cfg.batch_bytes_max);
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                { let _ = sockref.set_nosigpipe(true); }
+                if let Ok(effective) = sockref.send_buffer_size() {
+                    eprintln!("geyser-plugin-ultra: send buffer size ~{} bytes", effective);
+                }
                 // Batch & drain loop
-                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cfg.batch_max);
+                let mut batch: Vec<PooledBuf> = Vec::with_capacity(cfg.batch_max);
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    // blocking recv
-                    match rx.recv_timeout(Duration::from_millis(1)) {
+                    // Shutdown-responsive first receive
+                    match rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(first) => {
-                            let mut size = first.len();
+                            let mut size = first.as_ref().len();
                             batch.push(first);
                             let start = Instant::now();
+                            let deadline = if cfg.flush_after_ms > 0 { Some(start + Duration::from_millis(cfg.flush_after_ms)) } else { None };
                             while batch.len() < cfg.batch_max && size < cfg.batch_bytes_max {
-                                if start.elapsed() >= Duration::from_millis(cfg.flush_after_ms) { break; }
+                                if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
                                 match rx.try_recv() {
                                     Ok(m) => {
-                                        size += m.len();
-                                        if size > cfg.batch_bytes_max { break; }
+                                        let mlen = m.as_ref().len();
+                                        if size + mlen > cfg.batch_bytes_max { break; }
+                                        size += mlen;
                                         batch.push(m);
+                                        continue;
                                     }
-                                    Err(_) => break,
+                                    Err(_) => {
+                                        if let Some(dl) = deadline {
+                                            // Wait until the deadline for another message.
+                                            let now = Instant::now();
+                                            if now >= dl { break; }
+                                            let remaining = dl.saturating_duration_since(now);
+                                            match rx.recv_timeout(remaining) {
+                                                Ok(m) => {
+                                                    let mlen = m.as_ref().len();
+                                                    if size + mlen > cfg.batch_bytes_max { break; }
+                                                    size += mlen;
+                                                    batch.push(m);
+                                                    continue;
+                                                }
+                                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    },
                                 }
                             }
-                            let start = Instant::now();
-                            if let Err(e) = write_all_vectored(&mut stream, &batch) {
-                                eprintln!("geyser-plugin-ultra: write error: {e}");
-                                break;
+                            let write_start = Instant::now();
+                            // Build borrowed slices for this batch
+                            let mut slices: Vec<&[u8]> = Vec::with_capacity(batch.len());
+                            for b in &batch { slices.push(b.as_ref()); }
+                            // Transient backpressure handling
+                            loop {
+                                match write_all_vectored_slices(&mut stream, &slices) {
+                                    Ok(()) => break,
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                                        counter!("ultra_write_timeouts_total").increment(1);
+                                        if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                                        thread::sleep(Duration::from_millis(1));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("geyser-plugin-ultra: write error: {e}");
+                                        break;
+                                    }
+                                }
                             }
-                            let elapsed = start.elapsed().as_nanos() as f64 / 1_000_000.0;
+                            let elapsed = write_start.elapsed().as_nanos() as f64 / 1_000_000.0;
                             counter!("ultra_bytes_sent_total").increment(size as u64);
                             counter!("ultra_batches_sent_total").increment(1);
+                            histogram!("ultra_batch_len").record(batch.len() as f64);
+                            histogram!("ultra_batch_bytes").record(size as f64);
                             HISTO_SEQ.with(|seq| {
                                 let v = seq.get();
                                 seq.set(v.wrapping_add(1));
-                                if (v & HISTO_SAMPLE_MASK) == 0 {
+                                if (v & histo_mask) == 0 {
                                     histogram!("ultra_batch_ms").record(elapsed);
                                 }
                             });
+                            gauge!("ultra_channel_depth").set(rx.len() as f64);
                             batch.clear();
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => { if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; } else { continue; } }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                     }
                 }
                 // Broken pipe; reconnect
-                thread::sleep(Duration::from_millis(100));
-                backoff = Duration::from_millis(50);
+                backoff = backoff.max(Duration::from_millis(200)).min(Duration::from_secs(2));
+                counter!("ultra_reconnects_total").increment(1);
+                backoff_seq = backoff_seq.wrapping_add(1);
+                let jitter = std::cmp::min(Duration::from_millis((backoff_seq & 0x1F) as u64), backoff / 2);
+                let sleep_for = backoff + jitter;
+                gauge!("ultra_reconnect_backoff_ms").set(sleep_for.as_millis() as f64);
+                thread::sleep(sleep_for);
             }
             Err(err) => {
-                eprintln!("geyser-plugin-ultra: connect {} failed: {err}", cfg.socket_path);
-                thread::sleep(backoff);
+                let now = Instant::now();
+                let should_log = last_connect_log.is_none()
+                    || backoff != last_logged_backoff
+                    || last_connect_log.map(|t| now.duration_since(t) >= Duration::from_secs(30)).unwrap_or(true);
+                if should_log {
+                    eprintln!("geyser-plugin-ultra: connect {} failed: {err} (backoff {:?})", cfg.socket_path.display(), backoff);
+                    last_connect_log = Some(now);
+                    last_logged_backoff = backoff;
+                }
+                counter!("ultra_connect_errors_total").increment(1);
+                backoff_seq = backoff_seq.wrapping_add(1);
+                let jitter = std::cmp::min(Duration::from_millis((backoff_seq & 0x1F) as u64), backoff / 2);
+                let sleep_for = backoff + jitter;
+                gauge!("ultra_reconnect_backoff_ms").set(sleep_for.as_millis() as f64);
+                thread::sleep(sleep_for);
                 backoff = (backoff * 2).min(Duration::from_secs(2));
                 continue;
             }

@@ -1,0 +1,16 @@
+syntax = "proto3";
+package bundle;
+
+import "packet.proto";
+import "shared.proto";
+
+message Bundle {
+  shared.Header header = 1;
+  repeated packet.Packet packets = 2;
+}
+
+message BundleResult {
+  string uuid = 1;
+}
+
+

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 use anyhow::Result;
 use faststreams::{decode_record, Record};
+use bytes::{Buf, BytesMut};
 use metrics::{counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::path::Path;
@@ -10,6 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use bs58;
 
 #[derive(Debug, serde::Deserialize)]
 struct KafkaCfg {
@@ -20,6 +22,44 @@ struct KafkaCfg {
     topic_slots: String,
 }
 
+fn json_view(rec: &Record) -> serde_json::Value {
+    match rec {
+        Record::Account(a) => serde_json::json!({
+            "type": "account",
+            "slot": a.slot,
+            "is_startup": a.is_startup,
+            "pubkey": bs58::encode(&a.pubkey).into_string(),
+            "lamports": a.lamports,
+            "owner": bs58::encode(&a.owner).into_string(),
+            "executable": a.executable,
+            "rent_epoch": a.rent_epoch,
+            "data_len": a.data.len(),
+        }),
+        Record::Tx(t) => serde_json::json!({
+            "type": "tx",
+            "slot": t.slot,
+            "signature": bs58::encode(&t.signature).into_string(),
+            "err": t.err,
+            "vote": t.vote,
+        }),
+        Record::Block(b) => serde_json::json!({
+            "type": "block",
+            "slot": b.slot,
+            "blockhash": b.blockhash.map(|h| bs58::encode(&h).into_string()),
+            "parent_slot": b.parent_slot,
+            "rewards_len": b.rewards_len,
+            "block_time_unix": b.block_time_unix,
+            "leader": b.leader.map(|l| bs58::encode(&l).into_string()),
+        }),
+        Record::Slot { slot, parent, status } => serde_json::json!({
+            "type": "slot",
+            "slot": slot,
+            "parent": parent,
+            "status": status,
+        }),
+        Record::EndOfStartup => serde_json::json!({"type": "end_of_startup"}),
+    }
+}
 #[derive(Debug, serde::Deserialize)]
 struct Cfg {
     uds_path: String,
@@ -30,34 +70,50 @@ struct Cfg {
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Clone)]
 struct KafkaSink {
-    prod: rdkafka::producer::FutureProducer,
-    cfg: KafkaCfg,
+    tx: tokio::sync::mpsc::Sender<Record>,
 }
 #[cfg(feature = "kafka")]
 impl KafkaSink {
     fn new(cfg: KafkaCfg) -> Result<Self> {
         use rdkafka::ClientConfig;
-        let prod = ClientConfig::new()
-            .set("bootstrap.servers", &cfg.brokers)
-            .set("queue.buffering.max.messages", "2000000")
-            .set("queue.buffering.max.kbytes", "1048576")
-            .set("message.timeout.ms", "5000")
-            .create()?;
-        Ok(Self { prod, cfg })
+        use rdkafka::producer::{FutureProducer, FutureRecord};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(65_536);
+        tokio::spawn(async move {
+            let prod: FutureProducer = match ClientConfig::new()
+                .set("bootstrap.servers", &cfg.brokers)
+                .set("queue.buffering.max.messages", "2000000")
+                .set("queue.buffering.max.kbytes", "1048576")
+                .set("message.timeout.ms", "5000")
+                .create()
+            {
+                Ok(p) => p,
+                Err(e) => { eprintln!("kafka producer init failed: {e}"); return; }
+            };
+            while let Some(rec) = rx.recv().await {
+                let (topic, key) = match &rec {
+                    Record::Account(a) => (&cfg.topic_accounts, bs58::encode(&a.pubkey).into_string()),
+                    Record::Tx(t) => (&cfg.topic_txs, bs58::encode(&t.signature).into_string()),
+                    Record::Block(b) => {
+                        let k = b.blockhash.map(|h| bs58::encode(h).into_string()).unwrap_or_default();
+                        (&cfg.topic_blocks, k)
+                    }
+                    Record::Slot { slot, .. } => (&cfg.topic_slots, slot.to_string()),
+                    Record::EndOfStartup => (&cfg.topic_slots, "eos".to_string()),
+                };
+                if let Ok(payload) = bincode::serialize(&rec) {
+                    let _ = prod
+                        .send(FutureRecord::to(topic).key(&key).payload(&payload), std::time::Duration::from_secs(1))
+                        .await;
+                }
+            }
+        });
+        Ok(Self { tx })
     }
-    async fn send(&self, rec: &Record) -> Result<()> {
-        use rdkafka::producer::FutureRecord;
-        let (topic, key) = match rec {
-            Record::Account(a) => (&self.cfg.topic_accounts, hex::encode(&a.pubkey)),
-            Record::Tx(t) => (&self.cfg.topic_txs, t.signature_b58.clone()),
-            Record::Block(b) => (&self.cfg.topic_blocks, b.blockhash_b58.clone().unwrap_or_default()),
-            Record::Slot { slot, .. } => (&self.cfg.topic_slots, slot.to_string()),
-            Record::EndOfStartup => (&self.cfg.topic_slots, "eos".to_string()),
-        };
-        let payload = bincode::serialize(rec)?;
-        let _ = self.prod.send(FutureRecord::to(topic).key(&key).payload(&payload), std::time::Duration::from_secs(1)).await;
-        Ok(())
+
+    fn try_send(&self, rec: Record) {
+        let _ = self.tx.try_send(rec);
     }
 }
 
@@ -81,6 +137,13 @@ async fn main() -> Result<()> {
         let _ = std::fs::remove_file(&cfg.uds_path);
     }
     let listener = UnixListener::bind(&cfg.uds_path)?;
+    // best-effort: set perms to 0660 for controlled access
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&cfg.uds_path) {
+            let _ = std::fs::set_permissions(&cfg.uds_path, std::fs::Permissions::from_mode(0o660));
+        }
+    }
     info!("listening UDS {}", cfg.uds_path);
 
     #[cfg(feature = "kafka")]
@@ -112,33 +175,30 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")] ks: Option<KafkaSink>) -> Result<()> {
-    let mut buf = Vec::with_capacity(1 << 20);
+    let mut buf = BytesMut::with_capacity(1 << 20);
     loop {
-        // read one frame at a time using the blocking decode API over a memory buffer
-        // read available bytes
-        let mut tmp = [0u8; 65536];
-        let n = sock.read(&mut tmp).await?;
+        // read available bytes directly into the growable buffer
+        let n = sock.read_buf(&mut buf).await?;
         if n == 0 { break; }
-        buf.extend_from_slice(&tmp[..n]);
 
         // Try to peel records out
-        let mut cursor = std::io::Cursor::new(&buf);
+        let mut cursor = std::io::Cursor::new(&buf[..]);
         loop {
             let pos = cursor.position() as usize;
             match faststreams::decode_record(&mut cursor) {
                 Ok(rec) => {
                     if cfg.stdout_json {
-                        let line = serde_json::to_string(&rec)?;
-                        println!("{line}");
+                        // Render as JSON with human-friendly base58 for byte arrays
+                        println!("{}", serde_json::to_string(&json_view(&rec))?);
                     }
                     counter!("ultra_records_ingested_total").increment(1);
                     #[cfg(feature = "kafka")]
-                    if let Some(k) = &ks { let _ = k.send(&rec).await; }
+                    if let Some(k) = &ks { k.try_send(rec); }
                 }
                 Err(faststreams::StreamError::BadHeader) => {
                     // desync; drop up to pos+1
                     let drop_to = pos.saturating_add(1);
-                    buf.drain(..drop_to);
+                    buf.advance(drop_to);
                     break;
                 }
                 Err(faststreams::StreamError::Io(_)) => break,
@@ -149,10 +209,10 @@ async fn handle_client(mut sock: UnixStream, cfg: Cfg, #[cfg(feature = "kafka")]
                 Err(faststreams::StreamError::Ser(_)) => break,
             }
         }
-        // drain consumed bytes
+        // advance consumed bytes without copying
         let consumed = cursor.position() as usize;
         if consumed > 0 && consumed <= buf.len() {
-            buf.drain(..consumed);
+            buf.advance(consumed);
         }
     }
     Ok(())

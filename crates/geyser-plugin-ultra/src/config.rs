@@ -17,6 +17,8 @@ pub struct Config {
     pub queue_capacity: usize,
     #[serde(default = "default_batch")]
     pub batch_max: usize,
+    #[serde(default = "default_batch_bytes")]
+    pub batch_bytes_max: usize,
     #[serde(default = "default_streams")]
     pub streams: Streams,
     #[serde(default)]
@@ -33,6 +35,9 @@ fn default_capacity() -> usize {
 }
 fn default_batch() -> usize {
     4096
+}
+fn default_batch_bytes() -> usize {
+    4 * 1024 * 1024
 }
 fn default_streams() -> Streams {
     Streams { accounts: true, transactions: true, blocks: true, slots: true }

@@ -3,7 +3,6 @@ use crate::Config;
 use crossbeam_channel::Receiver;
 use faststreams::write_all_vectored;
 use metrics::{counter, histogram};
-use std::fs;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -26,24 +25,28 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
                 stream.set_nonblocking(false).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
                 // Batch & drain loop
+                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cfg.batch_max);
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    let mut batch = Vec::with_capacity(cfg.batch_max);
                     // blocking recv
                     match rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(first) => {
                             let mut size = first.len();
                             batch.push(first);
-                            while batch.len() < cfg.batch_max {
+                            while batch.len() < cfg.batch_max && size < cfg.batch_bytes_max {
                                 match rx.try_recv() {
-                                    Ok(m) => { size += m.len(); batch.push(m); }
+                                    Ok(m) => {
+                                        size += m.len();
+                                        if size > cfg.batch_bytes_max { break; }
+                                        batch.push(m);
+                                    }
                                     Err(_) => break,
                                 }
                             }
                             let start = Instant::now();
-                            if let Err(e) = write_all_vectored(&mut stream, batch) {
+                            if let Err(e) = write_all_vectored(&mut stream, &batch) {
                                 eprintln!("geyser-plugin-ultra: write error: {e}");
                                 break;
                             }
@@ -51,6 +54,7 @@ pub fn run_writer(cfg: Config, rx: Receiver<Vec<u8>>, shutdown: &std::sync::Arc<
                             counter!("ultra_bytes_sent_total").increment(size as u64);
                             counter!("ultra_batches_sent_total").increment(1);
                             histogram!("ultra_batch_ms").record(elapsed);
+                            batch.clear();
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,

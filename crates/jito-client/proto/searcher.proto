@@ -1,0 +1,20 @@
+syntax = "proto3";
+package searcher;
+
+import "bundle.proto";
+
+message GetTipAccountsRequest {}
+message GetTipAccountsResponse { repeated string accounts = 1; }
+
+message SendBundleRequest { bundle.Bundle bundle = 1; }
+message SendBundleResponse { string uuid = 1; }
+
+message SubscribeBundleResultsRequest {}
+
+service SearcherService {
+  rpc GetTipAccounts(GetTipAccountsRequest) returns (GetTipAccountsResponse);
+  rpc SendBundle(SendBundleRequest) returns (SendBundleResponse);
+  rpc SubscribeBundleResults(SubscribeBundleResultsRequest) returns (stream bundle.BundleResult);
+}
+
+

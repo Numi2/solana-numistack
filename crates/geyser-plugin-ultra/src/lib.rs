@@ -1,4 +1,3 @@
-// crates/geyser-plugin-ultra/src/lib.rs
 #![forbid(unsafe_code)]
 mod config;
 mod writer;
@@ -144,9 +143,11 @@ impl GeyserPlugin for Ultra {
             }
             _ => return Ok(())
         };
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(sig.as_ref());
         let rec = Record::Tx(TxUpdate {
             slot,
-            signature_b58: sig.to_string(),
+            signature: sig_bytes,
             err: err_opt,
             vote: is_vote,
         });
@@ -166,11 +167,11 @@ impl GeyserPlugin for Ultra {
         if let ReplicaBlockInfoVersions::V0_0_1(b) = blockinfo {
             let rec = Record::Block(BlockMeta {
                 slot: b.slot,
-                blockhash_b58: b.blockhash.map(|h| h.to_string()),
+                blockhash: b.blockhash.map(|h| h.to_bytes()),
                 parent_slot: b.parent_slot.unwrap_or(0),
                 rewards_len: b.rewards.as_deref().map(|r| r.len()).unwrap_or(0) as u32,
                 block_time_unix: b.block_time,
-                leader: b.leader.as_ref().map(|p| p.to_string()),
+                leader: b.leader.as_ref().map(|p| p.to_bytes()),
             });
             if let Ok(buf) = encode_record(&rec) {
                 if tx.try_send(buf).is_err() {
@@ -219,3 +220,5 @@ pub extern "C" fn _create_plugin() -> *mut c_void {
     let boxed: Box<dyn GeyserPlugin> = Box::new(plugin);
     Box::into_raw(boxed) as *mut c_void
 }
+
+

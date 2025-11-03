@@ -18,6 +18,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
+bs58 = "0.5.1"
 
 # optional sink
 rdkafka = { version = "0.36.2", optional = true, default-features = false, features = ["cmake-build"] }

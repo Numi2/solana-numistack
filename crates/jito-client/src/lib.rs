@@ -1,4 +1,3 @@
-// crates/jito-client/src/lib.rs
 #![forbid(unsafe_code)]
 pub mod jito {
     pub mod auth { tonic::include_proto!("auth"); }
@@ -36,11 +35,11 @@ impl JitoClient {
 
     pub async fn connect_with_bearer(endpoint: &str, bearer: &str) -> Result<Self> {
         let token = format!("Bearer {}", bearer);
-        let mut channel = Channel::from_shared(endpoint.to_string())?
+        let channel = Channel::from_shared(endpoint.to_string())?
             .tls_config(ClientTlsConfig::new())?
             .connect()
             .await?;
-        let mut client = SearcherServiceClient::with_interceptor(channel.clone(), move |mut req: Request<()>| {
+        let client = SearcherServiceClient::with_interceptor(channel, move |mut req: Request<()>| {
             req.metadata_mut().insert("authorization", MetadataValue::try_from(token.clone()).unwrap());
             Ok(req)
         });
@@ -94,3 +93,5 @@ impl JitoClient {
         Ok(resp.into_inner())
     }
 }
+
+

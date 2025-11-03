@@ -1,4 +1,3 @@
-
 [package]
 name = "ys-consumer"
 version = "0.1.0"
@@ -13,5 +12,7 @@ tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 faststreams = { path = "../faststreams" }
 bincode = { workspace = true }
-yellowstone-grpc-client = "10.1.1"
-yellowstone-grpc-proto = "10.1.1"
+yellowstone-grpc-proto = { version = "10.1.1", default-features = false, features = ["tonic","tonic-compression"] }
+yellowstone-grpc-client = { version = "10.1.1", default-features = false }
+crossbeam-channel = { workspace = true }
+bs58 = "0.5.1"

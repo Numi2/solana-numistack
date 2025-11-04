@@ -1,13 +1,15 @@
+// Numan Thabit 2025
 // crates/faststreams/src/lib.rs
 #![forbid(unsafe_code)]
-use serde::{Deserialize, Serialize};
 use bincode::Options;
-use std::io::{self, Read, Write};
-use std::io::IoSlice;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::io::IoSlice;
+use std::io::{self, Read, Write};
 
 const COMPRESS_THRESHOLD: usize = 2048;
 const IOV_MAX_DEFAULT: usize = 1024; // typical on Linux/macOS
+const INLINE_IOVEC_CAP: usize = IOV_MAX_DEFAULT;
 const FLAG_LZ4: u16 = 0x0001;
 
 pub const FRAME_MAGIC: u32 = 0x4653_5452; // 'FSTR'
@@ -52,7 +54,11 @@ pub enum Record {
     Account(AccountUpdate),
     Tx(TxUpdate),
     Block(BlockMeta),
-    Slot { slot: u64, parent: Option<u64>, status: u8 },
+    Slot {
+        slot: u64,
+        parent: Option<u64>,
+        status: u8,
+    },
     EndOfStartup,
 }
 
@@ -95,16 +101,25 @@ pub struct EncodeOptions {
 
 impl EncodeOptions {
     pub fn default_throughput() -> Self {
-        Self { enable_compression: true, compress_threshold: COMPRESS_THRESHOLD }
+        Self {
+            enable_compression: true,
+            compress_threshold: COMPRESS_THRESHOLD,
+        }
     }
     pub fn latency_uds() -> Self {
         // Disable compression for low-latency local sockets
-        Self { enable_compression: false, compress_threshold: usize::MAX }
+        Self {
+            enable_compression: false,
+            compress_threshold: usize::MAX,
+        }
     }
     /// Throughput-oriented remote hop: enable LZ4 with a low threshold to
     /// compress even relatively small payloads.
     pub fn throughput_lz4_low() -> Self {
-        Self { enable_compression: true, compress_threshold: 512 }
+        Self {
+            enable_compression: true,
+            compress_threshold: 512,
+        }
     }
 }
 
@@ -146,7 +161,10 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
 }
 
 /// Encode a borrowed record (e.g. `RecordRef::Account`) avoiding intermediate copies.
-pub fn encode_record_ref_with(rec: &RecordRef<'_>, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
+pub fn encode_record_ref_with(
+    rec: &RecordRef<'_>,
+    opts: EncodeOptions,
+) -> Result<Vec<u8>, StreamError> {
     let bincode_opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes();
@@ -179,7 +197,11 @@ pub fn encode_record_ref_with(rec: &RecordRef<'_>, opts: EncodeOptions) -> Resul
 }
 
 /// Encode a borrowed record directly into the provided buffer, avoiding an intermediate allocation.
-pub fn encode_record_ref_into_with(rec: &RecordRef<'_>, buf: &mut Vec<u8>, opts: EncodeOptions) -> Result<(), StreamError> {
+pub fn encode_record_ref_into_with(
+    rec: &RecordRef<'_>,
+    buf: &mut Vec<u8>,
+    opts: EncodeOptions,
+) -> Result<(), StreamError> {
     let bincode_opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes();
@@ -189,7 +211,9 @@ pub fn encode_record_ref_into_with(rec: &RecordRef<'_>, buf: &mut Vec<u8>, opts:
         let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
             let compressed = lz4_flex::block::compress_prepend_size(&payload);
             (FLAG_LZ4, compressed)
-        } else { (0, payload) };
+        } else {
+            (0, payload)
+        };
         buf.reserve(12 + body.len());
         buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
         buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
@@ -211,7 +235,11 @@ pub fn encode_record_ref_into_with(rec: &RecordRef<'_>, buf: &mut Vec<u8>, opts:
 
 /// Encode into the provided buffer, reusing its capacity when possible.
 /// The buffer is cleared before writing and will contain one full frame on success.
-pub fn encode_into_with(rec: &Record, buf: &mut Vec<u8>, opts: EncodeOptions) -> Result<(), StreamError> {
+pub fn encode_into_with(
+    rec: &Record,
+    buf: &mut Vec<u8>,
+    opts: EncodeOptions,
+) -> Result<(), StreamError> {
     let bincode_opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes();
@@ -272,7 +300,10 @@ pub fn decode_record(mut src: impl Read) -> Result<Record, StreamError> {
 }
 
 /// Decode without copying the body when uncompressed; returns (record, bytes_consumed).
-pub fn decode_record_from_slice(src: &[u8], scratch: &mut Vec<u8>) -> Result<(Record, usize), StreamError> {
+pub fn decode_record_from_slice(
+    src: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<(Record, usize), StreamError> {
     if src.len() < 12 {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }
@@ -299,7 +330,10 @@ pub fn decode_record_from_slice(src: &[u8], scratch: &mut Vec<u8>) -> Result<(Re
                 let rec = bincode_opts.deserialize::<Record>(&scratch[..])?;
                 Ok((rec, total))
             }
-            Err(e) => Err(StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))
+            Err(e) => Err(StreamError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                e,
+            ))),
         }
     } else {
         let rec = bincode_opts.deserialize::<Record>(body)?;
@@ -316,27 +350,40 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
 
     while frame_idx < frames.len() {
         let remaining_frames = frames.len() - frame_idx;
-        let pre_cap = if remaining_frames < iov_max { remaining_frames } else { iov_max };
-        let mut iovecs: SmallVec<[IoSlice<'_>; 256]> = SmallVec::with_capacity(pre_cap);
+        let pre_cap = if remaining_frames < iov_max {
+            remaining_frames
+        } else {
+            iov_max
+        };
+        let mut iovecs: SmallVec<[IoSlice<'_>; INLINE_IOVEC_CAP]> =
+            SmallVec::with_capacity(pre_cap);
         let mut added = 0usize;
         let mut idx = frame_idx;
         while idx < frames.len() && added < iov_max {
             if idx == frame_idx && first_offset != 0 {
                 let s = &frames[idx][first_offset..];
-                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+                if !s.is_empty() {
+                    iovecs.push(IoSlice::new(s));
+                }
             } else {
                 let s = &frames[idx];
-                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+                if !s.is_empty() {
+                    iovecs.push(IoSlice::new(s));
+                }
             }
             added += 1;
             idx += 1;
         }
 
         let n = dst.write_vectored(&iovecs)?;
-        if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
 
         let mut remaining = n;
-        if remaining == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+        if remaining == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
         if first_offset != 0 {
             let slice_len = frames[frame_idx].len() - first_offset;
             if remaining >= slice_len {
@@ -349,7 +396,9 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
             }
         }
         while remaining > 0 {
-            if frame_idx >= frames.len() { break; }
+            if frame_idx >= frames.len() {
+                break;
+            }
             let slice_len = frames[frame_idx].len();
             if remaining >= slice_len {
                 remaining -= slice_len;
@@ -371,27 +420,40 @@ pub fn write_all_vectored_slices(mut dst: impl Write, frames: &[&[u8]]) -> io::R
 
     while frame_idx < frames.len() {
         let remaining_frames = frames.len() - frame_idx;
-        let pre_cap = if remaining_frames < iov_max { remaining_frames } else { iov_max };
-        let mut iovecs: SmallVec<[IoSlice<'_>; 256]> = SmallVec::with_capacity(pre_cap);
+        let pre_cap = if remaining_frames < iov_max {
+            remaining_frames
+        } else {
+            iov_max
+        };
+        let mut iovecs: SmallVec<[IoSlice<'_>; INLINE_IOVEC_CAP]> =
+            SmallVec::with_capacity(pre_cap);
         let mut added = 0usize;
         let mut idx = frame_idx;
         while idx < frames.len() && added < iov_max {
             if idx == frame_idx && first_offset != 0 {
                 let s = &frames[idx][first_offset..];
-                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+                if !s.is_empty() {
+                    iovecs.push(IoSlice::new(s));
+                }
             } else {
                 let s = frames[idx];
-                if !s.is_empty() { iovecs.push(IoSlice::new(s)); }
+                if !s.is_empty() {
+                    iovecs.push(IoSlice::new(s));
+                }
             }
             added += 1;
             idx += 1;
         }
 
         let n = dst.write_vectored(&iovecs)?;
-        if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
 
         let mut remaining = n;
-        if remaining == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short write")); }
+        if remaining == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
         if first_offset != 0 {
             let slice_len = frames[frame_idx].len() - first_offset;
             if remaining >= slice_len {
@@ -404,7 +466,9 @@ pub fn write_all_vectored_slices(mut dst: impl Write, frames: &[&[u8]]) -> io::R
             }
         }
         while remaining > 0 {
-            if frame_idx >= frames.len() { break; }
+            if frame_idx >= frames.len() {
+                break;
+            }
             let slice_len = frames[frame_idx].len();
             if remaining >= slice_len {
                 remaining -= slice_len;

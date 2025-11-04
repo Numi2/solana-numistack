@@ -1,0 +1,16 @@
+[package]
+name = "ultra-rpc-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4.5.20", features = ["derive"] }
+humantime = "2.1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread", "process", "signal", "time", "io-util"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

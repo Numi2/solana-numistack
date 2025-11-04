@@ -1,0 +1,36 @@
+# Example configfor solana-validator-observer
+
+metrics_bind = "0.0.0.0:9898"
+scrape_interval = "2s"
+
+[[validators]]
+name = "validator-a"
+gossip_addr = "127.0.0.1:8001"
+quic_addr = "127.0.0.1:9001"
+rpc_url = "http://127.0.0.1:8899"
+expected_slot_lookback = 64
+max_slot_interval = "800ms"
+
+[[validators]]
+name = "validator-b"
+gossip_addr = "127.0.0.1:8002"
+quic_addr = "127.0.0.1:9002"
+rpc_url = "http://127.0.0.1:8899"
+expected_slot_lookback = 64
+
+[telemetry]
+enabled = true
+interface = "lo0"
+validator_ports = [8001, 8002, 9001, 9002]
+sampling_interval = "200ms"
+ring_buffer_interval = "100ms"
+
+[alerting]
+webhook_url = "https://example.com/slot-lag"
+slot_lag_threshold = 32
+cooldown = "30s"
+
+[flamegraph]
+enabled = true
+refresh_interval = "45s"
+

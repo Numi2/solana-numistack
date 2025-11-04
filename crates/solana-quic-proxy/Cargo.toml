@@ -1,0 +1,31 @@
+[package]
+name = "solana-quic-proxy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+arc-swap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync", "io-util"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+rustls-pemfile = "1.0"
+prometheus = "0.13"
+clap = { version = "4.5", features = ["derive", "env"] }
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace"] }
+rustls-native-certs = "0.6"
+futures = "0.3"
+toml = "0.8"
+
+[dev-dependencies]
+rcgen = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+tempfile = "3.10"

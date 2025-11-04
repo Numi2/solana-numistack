@@ -1,3 +1,4 @@
+// Numan Thabit 2025
 fn main() {
     let protos = vec![
         // "proto/auth.proto",  // Empty
@@ -11,7 +12,6 @@ fn main() {
     tonic_build::configure()
         .build_client(true)
         .build_server(false)
-        .compile_protos(&protos, &["proto"]).expect("compile protos");
+        .compile_protos(&protos, &["proto"])
+        .expect("compile protos");
 }
-
-

@@ -1,23 +1,26 @@
+// Numan Thabit 2025
 // crates/ultra-aggregator/src/main.rs
 #![forbid(unsafe_code)]
 use anyhow::Result;
-use faststreams::{Record, decode_record_from_slice};
 use bytes::{Buf, BytesMut};
+use faststreams::{decode_record_from_slice, Record};
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use serde::ser::{SerializeMap, Serializer};
+use socket2::SockRef;
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use socket2::SockRef;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::io::Write;
-use serde::ser::{SerializeMap, Serializer};
 
 #[cfg(feature = "kafka")]
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct KafkaCfg {
     brokers: String,
     topic_accounts: String,
@@ -48,26 +51,36 @@ struct KafkaSink {
 #[cfg(feature = "kafka")]
 impl KafkaSink {
     fn new(cfg: KafkaCfg) -> Result<Self> {
-        use rdkafka::ClientConfig;
+        use rdkafka::client::DefaultClientContext;
         use rdkafka::producer::{FutureProducer, FutureRecord};
+        use rdkafka::util::TokioRuntime;
+        use rdkafka::ClientConfig;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(65_536);
         tokio::spawn(async move {
-            let prod: FutureProducer = match ClientConfig::new()
+            let prod: FutureProducer<DefaultClientContext, TokioRuntime> = match ClientConfig::new()
                 .set("bootstrap.servers", &cfg.brokers)
                 .set("queue.buffering.max.messages", "2000000")
                 .set("queue.buffering.max.kbytes", "1048576")
                 .set("message.timeout.ms", "5000")
-                .create()
+                .create::<FutureProducer<DefaultClientContext, TokioRuntime>>()
             {
                 Ok(p) => p,
-                Err(e) => { eprintln!("kafka producer init failed: {e}"); return; }
+                Err(e) => {
+                    eprintln!("kafka producer init failed: {e}");
+                    return;
+                }
             };
             while let Some(rec) = rx.recv().await {
                 let (topic, key) = match &rec {
-                    Record::Account(a) => (&cfg.topic_accounts, bs58::encode(&a.pubkey).into_string()),
+                    Record::Account(a) => {
+                        (&cfg.topic_accounts, bs58::encode(&a.pubkey).into_string())
+                    }
                     Record::Tx(t) => (&cfg.topic_txs, bs58::encode(&t.signature).into_string()),
                     Record::Block(b) => {
-                        let k = b.blockhash.map(|h| bs58::encode(h).into_string()).unwrap_or_default();
+                        let k = b
+                            .blockhash
+                            .map(|h| bs58::encode(h).into_string())
+                            .unwrap_or_default();
                         (&cfg.topic_blocks, k)
                     }
                     Record::Slot { slot, .. } => (&cfg.topic_slots, slot.to_string()),
@@ -75,7 +88,10 @@ impl KafkaSink {
                 };
                 if let Ok(payload) = bincode::serialize(&rec) {
                     let _ = prod
-                        .send(FutureRecord::to(topic).key(&key).payload(&payload), std::time::Duration::from_secs(1))
+                        .send(
+                            FutureRecord::to(topic).key(&key).payload(&payload),
+                            std::time::Duration::from_secs(1),
+                        )
                         .await;
                 }
             }
@@ -99,9 +115,15 @@ impl JsonSink {
         std::thread::spawn(move || {
             let stdout = std::io::stdout();
             let mut w = std::io::LineWriter::new(stdout.lock());
+            let cache_cap = std::env::var("ULTRA_JSON_B58_CACHE_CAP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(16_384);
+            let mut cache32 = Base58Cache::<32>::new(cache_cap);
+            let mut cache64 = Base58Cache::<64>::new(cache_cap / 2);
             while let Some(evt) = rx.blocking_recv() {
                 gauge!("ultra_json_queue_depth").set(rx.len() as f64);
-                if write_json_event(&evt, &mut w).is_ok() {
+                if write_json_event(&evt, &mut w, &mut cache32, &mut cache64).is_ok() {
                     let _ = w.write_all(b"\n");
                 }
             }
@@ -120,10 +142,35 @@ const INGEST_SAMPLE_WEIGHT: u64 = 256;
 
 #[derive(Clone, Debug)]
 enum JsonEvent {
-    Account { slot: u64, is_startup: bool, pubkey: [u8; 32], lamports: u64, owner: [u8; 32], executable: bool, rent_epoch: u64, data_len: usize },
-    Tx { slot: u64, signature: [u8; 64], err: Option<String>, vote: bool },
-    Block { slot: u64, blockhash: Option<[u8; 32]>, parent_slot: Option<u64>, rewards_len: u32, block_time_unix: Option<i64>, leader: Option<[u8; 32]> },
-    Slot { slot: u64, parent: Option<u64>, status: u8 },
+    Account {
+        slot: u64,
+        is_startup: bool,
+        pubkey: [u8; 32],
+        lamports: u64,
+        owner: [u8; 32],
+        executable: bool,
+        rent_epoch: u64,
+        data_len: usize,
+    },
+    Tx {
+        slot: u64,
+        signature: [u8; 64],
+        err: Option<String>,
+        vote: bool,
+    },
+    Block {
+        slot: u64,
+        blockhash: Option<[u8; 32]>,
+        parent_slot: Option<u64>,
+        rewards_len: u32,
+        block_time_unix: Option<i64>,
+        leader: Option<[u8; 32]>,
+    },
+    Slot {
+        slot: u64,
+        parent: Option<u64>,
+        status: u8,
+    },
     EndOfStartup,
 }
 
@@ -139,52 +186,142 @@ fn json_event_from_record(rec: &Record) -> JsonEvent {
             rent_epoch: a.rent_epoch,
             data_len: a.data.len(),
         },
-        Record::Tx(t) => JsonEvent::Tx { slot: t.slot, signature: t.signature, err: t.err.clone(), vote: t.vote },
-        Record::Block(b) => JsonEvent::Block { slot: b.slot, blockhash: b.blockhash, parent_slot: b.parent_slot, rewards_len: b.rewards_len, block_time_unix: b.block_time_unix, leader: b.leader },
-        Record::Slot { slot, parent, status } => JsonEvent::Slot { slot: *slot, parent: *parent, status: *status },
+        Record::Tx(t) => JsonEvent::Tx {
+            slot: t.slot,
+            signature: t.signature,
+            err: t.err.clone(),
+            vote: t.vote,
+        },
+        Record::Block(b) => JsonEvent::Block {
+            slot: b.slot,
+            blockhash: b.blockhash,
+            parent_slot: b.parent_slot,
+            rewards_len: b.rewards_len,
+            block_time_unix: b.block_time_unix,
+            leader: b.leader,
+        },
+        Record::Slot {
+            slot,
+            parent,
+            status,
+        } => JsonEvent::Slot {
+            slot: *slot,
+            parent: *parent,
+            status: *status,
+        },
         Record::EndOfStartup => JsonEvent::EndOfStartup,
+    }
+}
+
+#[derive(Debug)]
+struct Base58Cache<const N: usize> {
+    map: std::collections::HashMap<[u8; N], Arc<str>>,
+    order: VecDeque<[u8; N]>,
+    capacity: usize,
+}
+
+impl<const N: usize> Base58Cache<N> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+        }
+    }
+
+    fn encode(&mut self, bytes: &[u8; N]) -> Arc<str> {
+        if self.capacity == 0 {
+            return Arc::from(bs58::encode(bytes).into_string().into_boxed_str());
+        }
+        if let Some(existing) = self.map.get(bytes) {
+            return Arc::clone(existing);
+        }
+        let encoded: Arc<str> = Arc::from(bs58::encode(bytes).into_string().into_boxed_str());
+        if self.map.len() == self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.order.push_back(*bytes);
+        self.map.insert(*bytes, Arc::clone(&encoded));
+        encoded
     }
 }
 
 // removed json_value_from_event: replaced with write_json_event for direct serialization
 
-fn write_json_event<W: Write>(evt: &JsonEvent, w: &mut W) -> serde_json::Result<()> {
+fn write_json_event<W: Write>(
+    evt: &JsonEvent,
+    w: &mut W,
+    cache32: &mut Base58Cache<32>,
+    cache64: &mut Base58Cache<64>,
+) -> serde_json::Result<()> {
     let mut ser = serde_json::Serializer::new(w);
     match evt {
-        JsonEvent::Account { slot, is_startup, pubkey, lamports, owner, executable, rent_epoch, data_len } => {
+        JsonEvent::Account {
+            slot,
+            is_startup,
+            pubkey,
+            lamports,
+            owner,
+            executable,
+            rent_epoch,
+            data_len,
+        } => {
+            let pubkey_b58 = cache32.encode(pubkey);
+            let owner_b58 = cache32.encode(owner);
             let mut m = ser.serialize_map(Some(9))?;
             m.serialize_entry("type", "account")?;
             m.serialize_entry("slot", slot)?;
             m.serialize_entry("is_startup", is_startup)?;
-            m.serialize_entry("pubkey", &bs58::encode(pubkey).into_string())?;
+            m.serialize_entry("pubkey", pubkey_b58.as_ref())?;
             m.serialize_entry("lamports", lamports)?;
-            m.serialize_entry("owner", &bs58::encode(owner).into_string())?;
+            m.serialize_entry("owner", owner_b58.as_ref())?;
             m.serialize_entry("executable", executable)?;
             m.serialize_entry("rent_epoch", rent_epoch)?;
             m.serialize_entry("data_len", data_len)?;
             m.end()
         }
-        JsonEvent::Tx { slot, signature, err, vote } => {
+        JsonEvent::Tx {
+            slot,
+            signature,
+            err,
+            vote,
+        } => {
+            let sig_b58 = cache64.encode(signature);
             let mut m = ser.serialize_map(Some(5))?;
             m.serialize_entry("type", "tx")?;
             m.serialize_entry("slot", slot)?;
-            m.serialize_entry("signature", &bs58::encode(signature).into_string())?;
+            m.serialize_entry("signature", sig_b58.as_ref())?;
             m.serialize_entry("err", err)?;
             m.serialize_entry("vote", vote)?;
             m.end()
         }
-        JsonEvent::Block { slot, blockhash, parent_slot, rewards_len, block_time_unix, leader } => {
+        JsonEvent::Block {
+            slot,
+            blockhash,
+            parent_slot,
+            rewards_len,
+            block_time_unix,
+            leader,
+        } => {
+            let blockhash_b58 = blockhash.as_ref().map(|h| cache32.encode(h));
+            let leader_b58 = leader.as_ref().map(|l| cache32.encode(l));
             let mut m = ser.serialize_map(Some(7))?;
             m.serialize_entry("type", "block")?;
             m.serialize_entry("slot", slot)?;
-            m.serialize_entry("blockhash", &blockhash.map(|h| bs58::encode(h).into_string()))?;
+            m.serialize_entry("blockhash", &blockhash_b58.as_ref().map(|s| s.as_ref()))?;
             m.serialize_entry("parent_slot", parent_slot)?;
             m.serialize_entry("rewards_len", rewards_len)?;
             m.serialize_entry("block_time_unix", block_time_unix)?;
-            m.serialize_entry("leader", &leader.map(|l| bs58::encode(l).into_string()))?;
+            m.serialize_entry("leader", &leader_b58.as_ref().map(|s| s.as_ref()))?;
             m.end()
         }
-        JsonEvent::Slot { slot, parent, status } => {
+        JsonEvent::Slot {
+            slot,
+            parent,
+            status,
+        } => {
             let mut m = ser.serialize_map(Some(4))?;
             m.serialize_entry("type", "slot")?;
             m.serialize_entry("slot", slot)?;
@@ -206,14 +343,18 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
-    let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "configs/aggregator.json".to_string());
+    let cfg_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "configs/aggregator.json".to_string());
     let cfg: Cfg = {
         let raw = std::fs::read_to_string(&cfg_path)?;
         serde_json::from_str(&raw)?
     };
 
     if let Some(addr) = &cfg.metrics_addr {
-        let _ = PrometheusBuilder::new().with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap()).install();
+        let _ = PrometheusBuilder::new()
+            .with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap())
+            .install();
     }
 
     if Path::new(&cfg.uds_path).exists() {
@@ -221,7 +362,8 @@ async fn main() -> Result<()> {
     }
     let listener = UnixListener::bind(&cfg.uds_path)?;
     // best-effort: set perms to 0660 for controlled access
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(_meta) = std::fs::metadata(&cfg.uds_path) {
             let _ = std::fs::set_permissions(&cfg.uds_path, std::fs::Permissions::from_mode(0o660));
@@ -232,9 +374,15 @@ async fn main() -> Result<()> {
     #[cfg(feature = "kafka")]
     let kafka_sink = if let Some(k) = cfg.kafka.clone() {
         Some(KafkaSink::new(k)?)
-    } else { None };
+    } else {
+        None
+    };
 
-    let json_sink = if cfg.stdout_json { Some(JsonSink::new()) } else { None };
+    let json_sink = if cfg.stdout_json {
+        Some(JsonSink::new())
+    } else {
+        None
+    };
 
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -280,13 +428,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, max_frame_bytes: usize, #[cfg(feature = "kafka")] ks: Option<KafkaSink>) -> Result<()> {
+async fn handle_client(
+    mut sock: UnixStream,
+    json: Option<JsonSink>,
+    max_frame_bytes: usize,
+    #[cfg(feature = "kafka")] ks: Option<KafkaSink>,
+) -> Result<()> {
     let mut buf = BytesMut::with_capacity(1 << 20);
     let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
         // read available bytes directly into the growable buffer
         let n = sock.read_buf(&mut buf).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
 
         // Try to peel records out
         loop {
@@ -298,7 +453,9 @@ async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, max_frame_b
                     counter!("ultra_decode_bad_header_total").increment(1);
                     let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
                     if let Some(idx) = memchr::memmem::find(&buf[..], &magic_bytes) {
-                        if idx > 0 { buf.advance(idx); }
+                        if idx > 0 {
+                            buf.advance(idx);
+                        }
                     } else {
                         buf.clear();
                     }
@@ -331,7 +488,9 @@ async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, max_frame_b
                         counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
                     }
                     #[cfg(feature = "kafka")]
-                    if let Some(k) = &ks { k.try_send(rec); }
+                    if let Some(k) = &ks {
+                        k.try_send(rec);
+                    }
                     buf.advance(consumed);
                 }
                 Err(faststreams::StreamError::BadHeader) => {
@@ -339,15 +498,26 @@ async fn handle_client(mut sock: UnixStream, json: Option<JsonSink>, max_frame_b
                     // scan for next magic to resync
                     let magic = faststreams::FRAME_MAGIC.to_be_bytes();
                     if let Some(idx) = memchr::memmem::find(&buf[..], &magic) {
-                        if idx > 0 { buf.advance(idx); }
+                        if idx > 0 {
+                            buf.advance(idx);
+                        }
                     } else {
                         buf.clear();
                     }
                     break;
                 }
-                Err(faststreams::StreamError::De(_)) => { counter!("ultra_decode_need_more_total").increment(1); break }, // need more bytes
-                Err(faststreams::StreamError::Io(_)) => { counter!("ultra_decode_io_total").increment(1); break },
-                Err(faststreams::StreamError::Ser(_)) => { counter!("ultra_decode_ser_total").increment(1); break },
+                Err(faststreams::StreamError::De(_)) => {
+                    counter!("ultra_decode_need_more_total").increment(1);
+                    break;
+                } // need more bytes
+                Err(faststreams::StreamError::Io(_)) => {
+                    counter!("ultra_decode_io_total").increment(1);
+                    break;
+                }
+                Err(faststreams::StreamError::Ser(_)) => {
+                    counter!("ultra_decode_ser_total").increment(1);
+                    break;
+                }
             }
         }
     }

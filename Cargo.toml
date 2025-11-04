@@ -6,6 +6,9 @@ members = [
   "crates/ultra-aggregator",
   "crates/ys-consumer",
   "crates/jito-client",
+  "crates/solana-quic-proxy",
+  "crates/solana-validator-observer",
+  "crates/solana-ultra-rpc", "crates/ultra-rpc-bench",
 ]
 
 [workspace.package]
@@ -27,6 +30,22 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter"] }
 uuid = { version = "1.10.0", features = ["v4"] }
 time = { version = "0.3.36", features = ["formatting"] }
+arc-swap = "1.7.1"
+hashbrown = { version = "0.14.5", features = ["raw"] }
+quinn = { version = "0.11.4", default-features = false, features = ["runtime-tokio", "rustls"] }
+simd-json = { version = "0.10.5", features = ["serde_impl"] }
+opentelemetry = "0.20.0"
+opentelemetry-prometheus = "0.13.0"
+opentelemetry_sdk = { version = "0.20.0", features = ["metrics", "rt-tokio"] }
+rustls = { version = "0.23.5", default-features = false, features = ["ring"] }
+prometheus = "0.13.4"
+axum = { version = "0.7.5", features = ["http1", "json"] }
+tokio-stream = "0.1.15"
+tokio-util = { version = "0.7.11", features = ["full"] }
+bytesize = "1.3.0"
+once_cell = "1.19.0"
+base64 = "0.22.1"
+rcgen = "0.12.1"
 
 [profile.release]
 opt-level = 3

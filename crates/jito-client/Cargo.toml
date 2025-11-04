@@ -2,6 +2,7 @@
 name = "jito-client"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 
 [lib]
 name = "jito_client"
@@ -18,10 +19,19 @@ prost-build = "0.13.3"
 [dependencies]
 anyhow = { workspace = true }
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "time"] }
-tonic = { version = "0.12.3", features = ["tls"] }
+tonic = { version = "0.12.3", features = ["tls", "gzip"] }
 prost = "0.13.3"
 prost-types = "0.13.3"
 clap = { version = "4.5.18", features = ["derive"] }
 base64 = "0.22.1"
 time = { workspace = true }
+thiserror = "1.0.63"
+tracing = "0.1.40"
+http = "0.2.12"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tokio-stream = "0.1.17"
+futures-util = "0.3.31"
+
+[dev-dependencies]
+tokio = { version = "1.40.0", features = ["rt", "macros", "time"] }
 

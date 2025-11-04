@@ -1,3 +1,4 @@
+// Numan Thabit 2025
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
@@ -12,19 +13,26 @@ pub struct BufferPool {
 
 impl BufferPool {
     pub fn new(max_items: usize, default_capacity: usize) -> Arc<Self> {
-        Arc::new(Self { q: ArrayQueue::new(max_items), default_capacity })
-    }
-
-    /// Get a pooled buffer or allocate a new one with default capacity.
-    pub fn get(self: &Arc<Self>) -> PooledBuf {
-        if let Some(p) = self.try_get() { p } else { PooledBuf { inner: Some(Vec::with_capacity(self.default_capacity)), pool: Arc::clone(self) } }
+        Arc::new(Self {
+            q: ArrayQueue::new(max_items),
+            default_capacity,
+        })
     }
 
     /// Get a pooled buffer if available. Returns `None` when pool is empty to keep memory bounded.
     pub fn try_get(self: &Arc<Self>) -> Option<PooledBuf> {
-        let buf = match self.q.pop() { Some(b) => Some(b), None => { counter!("ultra_pool_get_miss_total").increment(1); None } };
+        let buf = match self.q.pop() {
+            Some(b) => Some(b),
+            None => {
+                counter!("ultra_pool_get_miss_total").increment(1);
+                None
+            }
+        };
         gauge!("ultra_pool_len").set(self.q.len() as f64);
-        buf.map(|b| PooledBuf { inner: Some(b), pool: Arc::clone(self) })
+        buf.map(|b| PooledBuf {
+            inner: Some(b),
+            pool: Arc::clone(self),
+        })
     }
 
     fn put(&self, mut buf: Vec<u8>) {
@@ -50,14 +58,18 @@ pub struct PooledBuf {
 impl PooledBuf {
     #[inline]
     pub fn inner_mut(&mut self) -> Option<&mut Vec<u8>> {
-        if cfg!(debug_assertions) { debug_assert!(self.inner.is_some(), "pooled buffer already taken"); }
+        if cfg!(debug_assertions) {
+            debug_assert!(self.inner.is_some(), "pooled buffer already taken");
+        }
         self.inner.as_mut()
     }
 
     #[inline]
     pub fn as_slice(&self) -> Option<&[u8]> {
-        if cfg!(debug_assertions) { debug_assert!(self.inner.is_some(), "pooled buffer already taken"); }
-        self.inner.as_ref().map(|v| v.as_slice())
+        if cfg!(debug_assertions) {
+            debug_assert!(self.inner.is_some(), "pooled buffer already taken");
+        }
+        self.inner.as_deref()
     }
 }
 
@@ -78,5 +90,3 @@ impl Drop for PooledBuf {
         }
     }
 }
-
-

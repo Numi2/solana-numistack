@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
+use base64::Engine as _;
 use serde::{ser::SerializeTuple, ser::Serializer, Deserialize, Serialize};
 use serde_json::{json, Value};
 use solana_sdk::pubkey::Pubkey;
@@ -66,17 +68,58 @@ impl RpcRouter {
                     .record_request("getSlot", start.elapsed().as_secs_f64(), 0);
                 Ok(RpcResult::Slot(RpcResponse::new(slot, slot)))
             }
-            other => Err(RpcCallError::method_not_found(other)),
+            other => {
+                let start = Instant::now();
+                self.metrics
+                    .record_request(other, start.elapsed().as_secs_f64(), 0);
+                Err(RpcCallError::method_not_found(other))
+            }
         }
     }
 
     async fn get_account_info(&self, params: &Value) -> Result<RpcResult, RpcCallError> {
         let start = Instant::now();
-        let (pubkey, _cfg) = parse_account_params(params)?;
-        let value = self
-            .cache
-            .get(&pubkey)
-            .map(|record| account_to_response(record.as_ref()));
+        let (pubkey, cfg) = match parse_account_params(params) {
+            Ok(v) => v,
+            Err(err) => {
+                self.metrics
+                    .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
+                return Err(err);
+            }
+        };
+
+        // Validate supported config
+        if let Some(enc) = &cfg.encoding {
+            if enc != "base64" {
+                self.metrics
+                    .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
+                return Err(RpcCallError::invalid_params("unsupported encoding; only base64 is supported"));
+            }
+        }
+        if let Some(commitment) = &cfg.commitment {
+            match commitment.as_str() {
+                "processed" | "confirmed" | "finalized" => {}
+                _ => {
+                    self.metrics
+                        .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
+                    return Err(RpcCallError::invalid_params("unsupported commitment"));
+                }
+            }
+        }
+        if let Some(required_slot) = cfg.min_context_slot {
+            let observed = self.slots.load();
+            if observed < required_slot {
+                self.metrics
+                    .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
+                return Err(RpcCallError::min_context_slot_not_reached(required_slot, observed));
+            }
+        }
+
+        // Build response (apply optional dataSlice)
+        let value = self.cache.get(&pubkey).map(|record| {
+            account_to_response_with_slice(record.as_ref(), cfg.data_slice.as_ref())
+        });
+
         let bytes = value.as_ref().map(data_size).unwrap_or(0);
         self.metrics
             .record_request("getAccountInfo", start.elapsed().as_secs_f64(), bytes);
@@ -86,17 +129,61 @@ impl RpcRouter {
 
     async fn get_multiple_accounts(&self, params: &Value) -> Result<RpcResult, RpcCallError> {
         let start = Instant::now();
-        let (pubkeys, _cfg) = parse_multiple_account_params(params)?;
+        let (pubkeys, cfg) = match parse_multiple_account_params(params) {
+            Ok(v) => v,
+            Err(err) => {
+                self.metrics
+                    .record_request("getMultipleAccounts", start.elapsed().as_secs_f64(), 0);
+                return Err(err);
+            }
+        };
+
+        // Validate supported config
+        if let Some(enc) = &cfg.encoding {
+            if enc != "base64" {
+                self.metrics.record_request(
+                    "getMultipleAccounts",
+                    start.elapsed().as_secs_f64(),
+                    0,
+                );
+                return Err(RpcCallError::invalid_params(
+                    "unsupported encoding; only base64 is supported",
+                ));
+            }
+        }
+        if let Some(commitment) = &cfg.commitment {
+            match commitment.as_str() {
+                "processed" | "confirmed" | "finalized" => {}
+                _ => {
+                    self.metrics.record_request(
+                        "getMultipleAccounts",
+                        start.elapsed().as_secs_f64(),
+                        0,
+                    );
+                    return Err(RpcCallError::invalid_params("unsupported commitment"));
+                }
+            }
+        }
+        if let Some(required_slot) = cfg.min_context_slot {
+            let observed = self.slots.load();
+            if observed < required_slot {
+                self.metrics.record_request(
+                    "getMultipleAccounts",
+                    start.elapsed().as_secs_f64(),
+                    0,
+                );
+                return Err(RpcCallError::min_context_slot_not_reached(required_slot, observed));
+            }
+        }
+
+        // Conservative per-key lookups to avoid coupling to shard math in this layer
         let mut total_bytes = 0usize;
         let mut results = Vec::with_capacity(pubkeys.len());
-        let snapshot = self.cache.snapshot();
-        let shard_mask = self.cache.shard_mask();
         for key in pubkeys {
-            let shard_idx = (key.as_ref()[0] as usize) & shard_mask;
-            let shard = &snapshot[shard_idx];
-            let entry = shard
+            let entry = self
+                .cache
                 .get(&key)
-                .map(|record| account_to_response(record.as_ref()));
+                .map(|record| account_to_response_with_slice(record.as_ref(), cfg.data_slice.as_ref()));
             total_bytes += entry.as_ref().map(data_size).unwrap_or(0);
             results.push(entry);
         }
@@ -181,23 +268,65 @@ fn parse_multiple_account_params(
 }
 
 fn data_size(info: &AccountInfoValue) -> usize {
-    info.original_data_len()
+    info.space()
 }
 
 fn account_to_response(record: &AccountRecord) -> AccountInfoValue {
     AccountInfoValue::from_record(record)
 }
 
+fn account_to_response_with_slice(
+    record: &AccountRecord,
+    data_slice: Option<&DataSliceConfig>,
+) -> AccountInfoValue {
+    if let Some(slice) = data_slice {
+        let data = record.data_slice();
+        let start = slice.offset.min(data.len());
+        let end = start.saturating_add(slice.length).min(data.len());
+        let window = &data[start..end];
+        let encoded: Arc<str> = if window.is_empty() {
+            Arc::<str>::from("")
+        } else {
+            Arc::<str>::from(BASE64_ENGINE.encode(window))
+        };
+        AccountInfoValue::from_record_with_data(record, encoded)
+    } else {
+        AccountInfoValue::from_record(record)
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct AccountConfig {
     #[allow(dead_code)]
     encoding: Option<String>,
+    #[serde(rename = "minContextSlot")]
+    #[allow(dead_code)]
+    min_context_slot: Option<u64>,
+    #[allow(dead_code)]
+    commitment: Option<String>,
+    #[serde(rename = "dataSlice")]
+    #[allow(dead_code)]
+    data_slice: Option<DataSliceConfig>,
 }
 
 #[derive(Deserialize, Default)]
 struct MultipleAccountConfig {
     #[allow(dead_code)]
     encoding: Option<String>,
+    #[serde(rename = "minContextSlot")]
+    #[allow(dead_code)]
+    min_context_slot: Option<u64>,
+    #[allow(dead_code)]
+    commitment: Option<String>,
+    #[serde(rename = "dataSlice")]
+    #[allow(dead_code)]
+    data_slice: Option<DataSliceConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct DataSliceConfig {
+    offset: usize,
+    length: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -209,21 +338,30 @@ pub struct AccountInfoValue {
     executable: bool,
     #[serde(rename = "rentEpoch")]
     rent_epoch: u64,
-    #[serde(skip)]
-    original_data_len: usize,
+    #[serde(rename = "space")]
+    space: usize,
 }
 
 impl AccountInfoValue {
     #[inline]
     /// Construct a payload from a cached account record.
     pub(crate) fn from_record(record: &AccountRecord) -> Self {
+        Self::from_record_with_data(record, record.data_base64())
+    }
+
+    #[inline]
+    /// Construct a payload from a cached account record with custom encoded data.
+    pub(crate) fn from_record_with_data(
+        record: &AccountRecord,
+        encoded_data: Arc<str>,
+    ) -> Self {
         Self {
             lamports: record.lamports(),
             owner: OwnerString::from(record.owner_arc()),
-            data: EncodedAccountData::new(record.data_base64()),
+            data: EncodedAccountData::new(encoded_data),
             executable: record.executable(),
             rent_epoch: record.rent_epoch(),
-            original_data_len: record.data_len(),
+            space: record.data_len(),
         }
     }
 
@@ -265,8 +403,8 @@ impl AccountInfoValue {
 
     #[inline]
     /// Length of the original binary account data before base64 encoding.
-    pub fn original_data_len(&self) -> usize {
-        self.original_data_len
+    pub fn space(&self) -> usize {
+        self.space
     }
 }
 
@@ -456,6 +594,14 @@ impl RpcCallError {
         }
     }
 
+    fn min_context_slot_not_reached(required: u64, observed: u64) -> Self {
+        Self {
+            code: -32016,
+            message: "minimum context slot not reached".into(),
+            data: Some(json!({ "required": required, "observed": observed })),
+        }
+    }
+
     /// Convert into JSON-RPC error object.
     pub fn into_error_object(self) -> Value {
         json!({
@@ -469,8 +615,8 @@ impl RpcCallError {
 impl From<serde_json::Error> for RpcCallError {
     fn from(err: serde_json::Error) -> Self {
         Self {
-            code: -32603,
-            message: "serialization error".into(),
+            code: -32602,
+            message: "invalid params".into(),
             data: Some(json!({"details": err.to_string()})),
         }
     }

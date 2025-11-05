@@ -122,7 +122,13 @@ where
                 // We've started a batch: flush on notify (to add more) or on earliest deadline.
                 let notified = self.notify.notified();
                 let next_deadline = age_deadline
-                    .map(|age| if age < soft_deadline { age } else { soft_deadline })
+                    .map(|age| {
+                        if age < soft_deadline {
+                            age
+                        } else {
+                            soft_deadline
+                        }
+                    })
                     .unwrap_or(soft_deadline);
                 tokio::select! {
                     _ = notified => {

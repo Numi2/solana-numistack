@@ -12,9 +12,9 @@ use smallvec::SmallVec;
 use socket2::SockRef;
 use std::cell::Cell;
 use std::io::IoSlice;
-use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -145,7 +145,8 @@ pub fn run_writer(
                         let s = Socket::new(Domain::UNIX, Type::SEQPACKET, None)
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                         s.set_nonblocking(false).ok();
-                        let _ = s.set_write_timeout(Some(Duration::from_millis(cfg.write_timeout_ms)));
+                        let _ =
+                            s.set_write_timeout(Some(Duration::from_millis(cfg.write_timeout_ms)));
                         s.connect(&addr)
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                         s
@@ -164,7 +165,8 @@ pub fn run_writer(
 
         match connect_result {
             Ok(mut stream) => {
-                counter!("ultra_connect_success_total", "shard" => writer_index.to_string()).increment(1);
+                counter!("ultra_connect_success_total", "shard" => writer_index.to_string())
+                    .increment(1);
                 #[cfg(target_os = "linux")]
                 #[allow(unused_mut)]
                 let mut send_fd: Option<std::os::fd::RawFd> = None;
@@ -173,7 +175,8 @@ pub fn run_writer(
                 match &mut stream {
                     EitherSocket::Stream(s) => {
                         s.set_nonblocking(false).ok();
-                        s.set_write_timeout(Some(Duration::from_millis(cfg.write_timeout_ms))).ok();
+                        s.set_write_timeout(Some(Duration::from_millis(cfg.write_timeout_ms)))
+                            .ok();
                         let sockref = SockRef::from(&*s);
                         let _ = sockref.set_send_buffer_size(cfg.batch_bytes_max);
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -181,7 +184,10 @@ pub fn run_writer(
                             let _ = sockref.set_nosigpipe(true);
                         }
                         if let Ok(effective) = sockref.send_buffer_size() {
-                            info!(target = "ultra.writer", "send buffer size ~{} bytes", effective);
+                            info!(
+                                target = "ultra.writer",
+                                "send buffer size ~{} bytes", effective
+                            );
                         }
                         #[cfg(target_os = "linux")]
                         {
@@ -193,7 +199,10 @@ pub fn run_writer(
                         let sockref = SockRef::from(&*s);
                         let _ = sockref.set_send_buffer_size(cfg.batch_bytes_max);
                         if let Ok(effective) = sockref.send_buffer_size() {
-                            info!(target = "ultra.writer", "send buffer size ~{} bytes", effective);
+                            info!(
+                                target = "ultra.writer",
+                                "send buffer size ~{} bytes", effective
+                            );
                         }
                         send_fd = Some(s.as_raw_fd());
                     }
@@ -205,6 +214,10 @@ pub fn run_writer(
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
+                    let depth = queue.len() as u64;
+                    gauge!("ultra_queue_len", "shard" => writer_index.to_string())
+                        .set(depth as f64);
+                    meter.observe_queue_depth_max(depth);
                     // Shutdown-responsive first receive
                     match pop_with_timeout(&queue, Duration::from_millis(50), shutdown) {
                         PopOutcome::Item(first) => {
@@ -266,7 +279,7 @@ pub fn run_writer(
                                 let cap = cfg.queue_capacity;
                                 if depth * 100 / cap >= 75 {
                                     if cur_flush_after_ms > 0 {
-                                        cur_flush_after_ms = (cur_flush_after_ms / 2).max(0);
+                                        cur_flush_after_ms /= 2;
                                     }
                                 } else if cur_flush_after_ms < cfg.flush_after_ms {
                                     // restore slowly
@@ -281,12 +294,15 @@ pub fn run_writer(
                             let mut write_ok = false;
                             {
                                 #[allow(unused_mut)]
-                                let mut block_start: Option<Instant> = None;
+                                let mut block_start: Option<
+                                    Instant,
+                                > = None;
                                 #[allow(unused_mut)]
                                 let mut spun = false;
                                 match &mut stream {
                                     EitherSocket::Stream(s) => {
-                                        let mut ios: SmallVec<[IoSlice<'_>; 64]> = SmallVec::with_capacity(send_batch.len().min(64));
+                                        let mut ios: SmallVec<[IoSlice<'_>; 64]> =
+                                            SmallVec::with_capacity(send_batch.len().min(64));
                                         for buf in &send_batch {
                                             if let Some(slice) = buf.as_slice() {
                                                 ios.push(IoSlice::new(slice));
@@ -295,28 +311,53 @@ pub fn run_writer(
                                         loop {
                                             match write_all_vectored_slices(s, ios.as_mut_slice()) {
                                                 Ok(()) => {
-                                                    if let Some(start) = block_start.take() { stall_ns += start.elapsed().as_nanos(); }
+                                                    if let Some(start) = block_start.take() {
+                                                        stall_ns += start.elapsed().as_nanos();
+                                                    }
                                                     write_ok = true;
                                                     break;
                                                 }
-                                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                                                Err(ref e)
+                                                    if e.kind()
+                                                        == std::io::ErrorKind::WouldBlock
+                                                        || e.kind()
+                                                            == std::io::ErrorKind::TimedOut =>
+                                                {
                                                     counter!("ultra_write_timeouts_total", "shard" => writer_index.to_string()).increment(1);
-                                                    if block_start.is_none() { block_start = Some(Instant::now()); }
+                                                    if block_start.is_none() {
+                                                        block_start = Some(Instant::now());
+                                                    }
                                                     if !spun {
                                                         counter!("ultra_write_backoff_total", "phase" => "spin", "shard" => writer_index.to_string()).increment(1);
-                                                        let spin_until = Instant::now() + Duration::from_micros(cfg.write_spin_cap_us);
-                                                        while Instant::now() < spin_until { std::hint::spin_loop(); }
+                                                        let spin_until = Instant::now()
+                                                            + Duration::from_micros(
+                                                                cfg.write_spin_cap_us,
+                                                            );
+                                                        while Instant::now() < spin_until {
+                                                            std::hint::spin_loop();
+                                                        }
                                                         spun = true;
                                                     } else {
                                                         counter!("ultra_write_backoff_total", "phase" => "sleep", "shard" => writer_index.to_string()).increment(1);
-                                                        thread::sleep(Duration::from_micros(cfg.write_sleep_backoff_us));
+                                                        thread::sleep(Duration::from_micros(
+                                                            cfg.write_sleep_backoff_us,
+                                                        ));
                                                     }
-                                                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                                                    if shutdown
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                    {
+                                                        break;
+                                                    }
                                                     continue;
                                                 }
                                                 Err(e) => {
-                                                    if let Some(start) = block_start.take() { stall_ns += start.elapsed().as_nanos(); }
-                                                    error!(target = "ultra.writer", "write error: {e}");
+                                                    if let Some(start) = block_start.take() {
+                                                        stall_ns += start.elapsed().as_nanos();
+                                                    }
+                                                    error!(
+                                                        target = "ultra.writer",
+                                                        "write error: {e}"
+                                                    );
                                                     counter!("ultra_write_errors_total", "shard" => writer_index.to_string()).increment(1);
                                                     counter!("ultra_dropped_total", "reason" => "write_blocked", "shard" => writer_index.to_string()).increment(send_batch.len() as u64);
                                                     break;
@@ -333,7 +374,8 @@ pub fn run_writer(
                                         let mut sent_total = 0usize;
                                         let total_msgs = scratch.len();
                                         loop {
-                                            let remaining = (total_msgs.saturating_sub(sent_total)).min(1024);
+                                            let remaining =
+                                                (total_msgs.saturating_sub(sent_total)).min(1024);
                                             if remaining == 0 {
                                                 write_ok = true;
                                                 break;
@@ -348,23 +390,43 @@ pub fn run_writer(
                                             };
                                             if ret < 0 {
                                                 let err = std::io::Error::last_os_error();
-                                                if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut {
+                                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                                    || err.kind() == std::io::ErrorKind::TimedOut
+                                                {
                                                     counter!("ultra_write_timeouts_total", "shard" => writer_index.to_string()).increment(1);
-                                                    if block_start.is_none() { block_start = Some(Instant::now()); }
+                                                    if block_start.is_none() {
+                                                        block_start = Some(Instant::now());
+                                                    }
                                                     if !spun {
                                                         counter!("ultra_write_backoff_total", "phase" => "spin", "shard" => writer_index.to_string()).increment(1);
-                                                        let spin_until = Instant::now() + Duration::from_micros(cfg.write_spin_cap_us);
-                                                        while Instant::now() < spin_until { std::hint::spin_loop(); }
+                                                        let spin_until = Instant::now()
+                                                            + Duration::from_micros(
+                                                                cfg.write_spin_cap_us,
+                                                            );
+                                                        while Instant::now() < spin_until {
+                                                            std::hint::spin_loop();
+                                                        }
                                                         spun = true;
                                                     } else {
                                                         counter!("ultra_write_backoff_total", "phase" => "sleep", "shard" => writer_index.to_string()).increment(1);
-                                                        thread::sleep(Duration::from_micros(cfg.write_sleep_backoff_us));
+                                                        thread::sleep(Duration::from_micros(
+                                                            cfg.write_sleep_backoff_us,
+                                                        ));
                                                     }
-                                                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                                                    if shutdown
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                    {
+                                                        break;
+                                                    }
                                                     continue;
                                                 } else {
-                                                    if let Some(start) = block_start.take() { stall_ns += start.elapsed().as_nanos(); }
-                                                    error!(target = "ultra.writer", "sendmmsg error: {err}");
+                                                    if let Some(start) = block_start.take() {
+                                                        stall_ns += start.elapsed().as_nanos();
+                                                    }
+                                                    error!(
+                                                        target = "ultra.writer",
+                                                        "sendmmsg error: {err}"
+                                                    );
                                                     counter!("ultra_write_errors_total", "shard" => writer_index.to_string()).increment(1);
                                                     counter!("ultra_dropped_total", "reason" => "write_blocked", "shard" => writer_index.to_string()).increment(send_batch.len() as u64);
                                                     break;
@@ -377,7 +439,9 @@ pub fn run_writer(
                                                 }
                                                 sent_total += ret as usize;
                                                 if sent_total >= total_msgs {
-                                                    if let Some(start) = block_start.take() { stall_ns += start.elapsed().as_nanos(); }
+                                                    if let Some(start) = block_start.take() {
+                                                        stall_ns += start.elapsed().as_nanos();
+                                                    }
                                                     write_ok = true;
                                                     break;
                                                 }
@@ -395,7 +459,8 @@ pub fn run_writer(
                             if write_ok {
                                 counter!("ultra_bytes_sent_total", "shard" => writer_index.to_string()).increment(size as u64);
                                 counter!("ultra_batches_sent_total", "shard" => writer_index.to_string()).increment(1);
-                                histogram!("ultra_batch_len", "shard" => writer_index.to_string()).record(send_batch.len() as f64);
+                                histogram!("ultra_batch_len", "shard" => writer_index.to_string())
+                                    .record(send_batch.len() as f64);
                                 histogram!("ultra_batch_bytes", "shard" => writer_index.to_string()).record(size as f64);
                                 HISTO_SEQ.with(|seq| {
                                     let v = seq.get();
@@ -429,7 +494,8 @@ pub fn run_writer(
                 backoff_seq = backoff_seq.wrapping_add(1);
                 let jitter = Duration::from_millis(backoff_seq & 0x1F).min(backoff / 2);
                 let sleep_for = backoff + jitter;
-                gauge!("ultra_reconnect_backoff_ms", "shard" => writer_index.to_string()).set(sleep_for.as_millis() as f64);
+                gauge!("ultra_reconnect_backoff_ms", "shard" => writer_index.to_string())
+                    .set(sleep_for.as_millis() as f64);
                 thread::sleep(sleep_for);
             }
             Err(err) => {
@@ -449,11 +515,13 @@ pub fn run_writer(
                     last_connect_log = Some(now);
                     last_logged_backoff = backoff;
                 }
-                counter!("ultra_connect_errors_total", "shard" => writer_index.to_string()).increment(1);
+                counter!("ultra_connect_errors_total", "shard" => writer_index.to_string())
+                    .increment(1);
                 backoff_seq = backoff_seq.wrapping_add(1);
                 let jitter = Duration::from_millis(backoff_seq & 0x1F).min(backoff / 2);
                 let sleep_for = backoff + jitter;
-                gauge!("ultra_reconnect_backoff_ms", "shard" => writer_index.to_string()).set(sleep_for.as_millis() as f64);
+                gauge!("ultra_reconnect_backoff_ms", "shard" => writer_index.to_string())
+                    .set(sleep_for.as_millis() as f64);
                 thread::sleep(sleep_for);
                 backoff = (backoff * 2).min(Duration::from_secs(2));
                 continue;

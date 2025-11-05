@@ -9,8 +9,6 @@ use faststreams::{decode_record_from_slice, Record};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 #[cfg(feature = "rkyv")]
-use rkyv;
-#[cfg(feature = "rkyv")]
 use rkyv::de::deserializers::SharedDeserializeMap;
 #[cfg(feature = "rkyv")]
 use rkyv::Deserialize;
@@ -80,9 +78,11 @@ impl KafkaSink {
         use rdkafka::util::TokioRuntime;
         use rdkafka::ClientConfig;
         let (tx, rx) = tokio::sync::mpsc::channel::<Record>(65_536);
-        let workers = cfg
-            .workers
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2));
+        let workers = cfg.workers.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+        });
         // Shared producer; FutureProducer is cheap to clone
         let prod: FutureProducer<DefaultClientContext, TokioRuntime> = match ClientConfig::new()
             .set("bootstrap.servers", &cfg.brokers)
@@ -113,10 +113,13 @@ impl KafkaSink {
                     drop(guard);
                     let Some(rec) = opt else { break };
                     let (topic, key) = match &rec {
-                        Record::Account(a) => {
-                            (&cfg_cl.topic_accounts, bs58::encode(&a.pubkey).into_string())
+                        Record::Account(a) => (
+                            &cfg_cl.topic_accounts,
+                            bs58::encode(&a.pubkey).into_string(),
+                        ),
+                        Record::Tx(t) => {
+                            (&cfg_cl.topic_txs, bs58::encode(&t.signature).into_string())
                         }
-                        Record::Tx(t) => (&cfg_cl.topic_txs, bs58::encode(&t.signature).into_string()),
                         Record::Block(b) => {
                             let k = b
                                 .blockhash
@@ -256,6 +259,7 @@ fn json_event_owned_from_record(rec: &Record) -> JsonEvent {
 }
 
 #[cfg(feature = "rkyv")]
+#[cfg_attr(feature = "rkyv", allow(dead_code))]
 fn json_event_from_archived_record(rec: &ArchivedRecord) -> JsonEvent {
     match rec {
         ArchivedRecord::Account(a) => JsonEvent::Account {
@@ -266,7 +270,7 @@ fn json_event_from_archived_record(rec: &ArchivedRecord) -> JsonEvent {
             owner: a.owner,
             executable: a.executable,
             rent_epoch: a.rent_epoch,
-            data_len: a.data.len() as usize,
+            data_len: a.data.len(),
         },
         ArchivedRecord::Tx(t) => {
             let err = match &t.err {
@@ -690,11 +694,13 @@ async fn handle_client(
                                 match arec.deserialize(&mut map) {
                                     Ok(rec) => {
                                         if out.try_send(rec).is_err() {
-                                            counter!("ultra_output_queue_dropped_total").increment(1);
+                                            counter!("ultra_output_queue_dropped_total")
+                                                .increment(1);
                                         }
                                         let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
                                         if (v & INGEST_SAMPLE_MASK) == 0 {
-                                            counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
+                                            counter!("ultra_records_ingested_total")
+                                                .increment(INGEST_SAMPLE_WEIGHT);
                                         }
                                     }
                                     Err(_) => {

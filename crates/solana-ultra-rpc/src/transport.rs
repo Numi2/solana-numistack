@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use quinn::{Connection, Endpoint, ReadExactError, ServerConfig, TransportConfig, VarInt};
 use quinn::crypto::rustls::QuicServerConfig;
+use quinn::{Connection, Endpoint, ReadExactError, ServerConfig, TransportConfig, VarInt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::ser::SerializeStruct;
@@ -179,16 +179,18 @@ async fn handle_stream(
 
         let request: JsonRpcRequest<'_> = simd_json::from_slice(buffers.payload.as_mut_slice())?;
         let JsonRpcRequest {
-            id,
-            method,
-            params,
-            ..
+            id, method, params, ..
         } = request;
+        let id = JsonRpcId::from_raw(id);
         // Only idempotent read-only methods are supported; future mutating methods should be
         // rejected on early-data paths.
-        let response = match router.handle(method, params).await {
-            Ok(result) => JsonRpcMessage::success(id, result),
-            Err(err) => JsonRpcMessage::error(id, err),
+        let response = {
+            let method_ref = method;
+            let params_ref = params;
+            match router.handle(method_ref, params_ref).await {
+                Ok(result) => JsonRpcMessage::success(id.clone(), result),
+                Err(err) => JsonRpcMessage::error(id, err),
+            }
         };
         buffers.begin_response();
         simd_json::to_writer(&mut buffers.response, &response)?;
@@ -227,9 +229,8 @@ fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
     tls_config.alpn_protocols = vec![b"jsonrpc-quic".to_vec()];
 
     // Convert to Quinn server config with custom transport.
-    let mut server_config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
-        tls_config,
-    )?));
+    let mut server_config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
     let mut transport = TransportConfig::default();
     transport.max_concurrent_bidi_streams(VarInt::from_u32(max_streams));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(3)));
@@ -251,34 +252,28 @@ struct JsonRpcRequest<'a> {
     params: Option<&'a RawValue>,
 }
 
-enum JsonRpcMessage<'a, T>
+enum JsonRpcMessage<T>
 where
     T: Serialize,
 {
-    Success {
-        id: Option<&'a RawValue>,
-        result: T,
-    },
-    Error {
-        id: Option<&'a RawValue>,
-        error: RpcCallError,
-    },
+    Success { id: JsonRpcId, result: T },
+    Error { id: JsonRpcId, error: RpcCallError },
 }
 
-impl<'a, T> JsonRpcMessage<'a, T>
+impl<T> JsonRpcMessage<T>
 where
     T: Serialize,
 {
-    fn success(id: Option<&'a RawValue>, result: T) -> Self {
+    fn success(id: JsonRpcId, result: T) -> Self {
         Self::Success { id, result }
     }
 
-    fn error(id: Option<&'a RawValue>, error: RpcCallError) -> Self {
+    fn error(id: JsonRpcId, error: RpcCallError) -> Self {
         Self::Error { id, error }
     }
 }
 
-impl<'a, T> Serialize for JsonRpcMessage<'a, T>
+impl<T> Serialize for JsonRpcMessage<T>
 where
     T: Serialize,
 {
@@ -290,21 +285,45 @@ where
         state.serialize_field("jsonrpc", "2.0")?;
         match self {
             JsonRpcMessage::Success { id, result } => {
-                match id {
-                    Some(raw) => state.serialize_field("id", raw)?,
-                    None => state.serialize_field("id", &())?,
-                }
+                state.serialize_field("id", id)?;
                 state.serialize_field("result", result)?;
             }
             JsonRpcMessage::Error { id, error } => {
-                match id {
-                    Some(raw) => state.serialize_field("id", raw)?,
-                    None => state.serialize_field("id", &())?,
-                }
+                state.serialize_field("id", id)?;
                 state.serialize_field("error", error)?;
             }
         }
         state.end()
+    }
+}
+
+#[derive(Clone)]
+struct JsonRpcId {
+    raw: Option<Box<RawValue>>,
+}
+
+impl JsonRpcId {
+    fn from_raw(raw: Option<&RawValue>) -> Self {
+        match raw {
+            Some(value) => {
+                let owned =
+                    RawValue::from_string(value.get().to_owned()).expect("valid JSON-RPC id");
+                Self { raw: Some(owned) }
+            }
+            None => Self { raw: None },
+        }
+    }
+}
+
+impl Serialize for JsonRpcId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.raw {
+            Some(raw) => raw.serialize(serializer),
+            None => serializer.serialize_unit(),
+        }
     }
 }
 

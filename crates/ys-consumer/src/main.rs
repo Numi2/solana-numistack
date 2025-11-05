@@ -1,6 +1,6 @@
 // Numan Thabit 2025
 // crates/ys-consumer/src/main.rs
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 mod shm_ring;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
@@ -941,7 +941,9 @@ async fn main() -> Result<()> {
                 .spawn(move || {
                     let mut backoff = Duration::from_millis(50);
                     loop {
-                        if sd2.load(Ordering::Relaxed) { break; }
+                        if sd2.load(Ordering::Relaxed) {
+                            break;
+                        }
                         match shm_ring::ShmRingWriter::open_or_create(&shm_path2, shm_cap_bytes) {
                             Ok(ring) => {
                                 info!("writing to SHM ring {}", shm_path2);
@@ -995,7 +997,9 @@ async fn main() -> Result<()> {
                 .spawn(move || {
                     let mut backoff = Duration::from_millis(50);
                     loop {
-                        if sd2.load(Ordering::Relaxed) { break; }
+                        if sd2.load(Ordering::Relaxed) {
+                            break;
+                        }
                         match shm_ring::ShmRingWriter::open_or_create(&shm_path2, shm_cap_bytes) {
                             Ok(ring) => {
                                 info!("writing to SHM ring {}", shm_path2);
@@ -1101,17 +1105,16 @@ async fn main() -> Result<()> {
         let keepalive_interval_ms = env_u64("YS_HTTP2_KEEPALIVE_INTERVAL_MS", 1_000);
         let keepalive_timeout_ms = env_u64("YS_HTTP2_KEEPALIVE_TIMEOUT_MS", 3_000);
         let tcp_keepalive_secs = env_u64("YS_TCP_KEEPALIVE_SECS", 30);
-        let concurrency_limit = env_usize("YS_GRPC_CONCURRENCY_LIMIT", 256);
+        let _concurrency_limit = env_usize("YS_GRPC_CONCURRENCY_LIMIT", 256);
         let connect_timeout_ms = env_u64("YS_CONNECT_TIMEOUT_MS", 3_000);
         // Best-effort: these builder methods may not exist in older deps; ignore errors by chaining options only when available.
         builder = builder
             .initial_connection_window_size(init_conn_window)
             .initial_stream_window_size(init_stream_window)
             .http2_keep_alive_interval(Duration::from_millis(keepalive_interval_ms))
-            .http2_keep_alive_timeout(Duration::from_millis(keepalive_timeout_ms))
-            .keepalive_while_idle(true)
+            .keep_alive_timeout(Duration::from_millis(keepalive_timeout_ms))
+            .keep_alive_while_idle(true)
             .tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)))
-            .concurrency_limit(concurrency_limit)
             .connect_timeout(Duration::from_millis(connect_timeout_ms));
         let mut client = match builder.connect().await {
             Ok(c) => c,

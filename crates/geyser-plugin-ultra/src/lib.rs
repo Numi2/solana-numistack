@@ -152,8 +152,8 @@ impl Ultra {
         match reason {
             "backpressure" | "queue_full" => self.meter.inc_dropped_queue_full(by),
             "no_buf" => self.meter.inc_dropped_no_buf(by),
-            "oversize" | "serialization_error" | "write_blocked" => {},
-            _ => {},
+            "oversize" | "serialization_error" | "write_blocked" => {}
+            _ => {}
         }
         counter!("ultra_dropped_total", "reason" => reason, "shard" => shard.to_string())
             .increment(by);
@@ -297,11 +297,9 @@ impl GeyserPlugin for Ultra {
 
         // Spawn low-priority metrics flusher if metrics exporter enabled
         if self.metrics_handle.is_some() {
-            if let Some(flusher) = meter::spawn_flusher(
-                Arc::clone(&self.meter),
-                self.producers.clone(),
-                Arc::clone(&self.shutdown),
-            ) {
+            if let Some(flusher) =
+                meter::spawn_flusher(Arc::clone(&self.meter), Arc::clone(&self.shutdown))
+            {
                 self.metrics_flusher = Some(flusher);
             }
         }
@@ -418,7 +416,11 @@ impl GeyserPlugin for Ultra {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     let cap_hint = self
                         .cfg
                         .as_ref()
@@ -508,7 +510,11 @@ impl GeyserPlugin for Ultra {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     let cap_hint = self
                         .cfg
                         .as_ref()
@@ -575,12 +581,19 @@ impl GeyserPlugin for Ultra {
                 block_time_unix: b.block_time,
                 leader: None, // Leader info not available in new API
             });
-            let idx = match self.writer_index_for_u64(b.slot) { Some(i) => i, None => return Ok(()) };
+            let idx = match self.writer_index_for_u64(b.slot) {
+                Some(i) => i,
+                None => return Ok(()),
+            };
             if let Some(pool) = self.pools.get(idx) {
                 if let Some(mut pb) = pool.try_get() {
                     if let Some(buf) = pb.inner_mut() {
                         let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                        let maybe_t0 = if (v & 0xFF) == 0 {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
                         let cap_hint = self
                             .cfg
                             .as_ref()
@@ -657,12 +670,19 @@ impl GeyserPlugin for Ultra {
             parent,
             status: st,
         };
-        let idx = match self.writer_index_for_u64(slot) { Some(i) => i, None => return Ok(()) };
+        let idx = match self.writer_index_for_u64(slot) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
         if let Some(pool) = self.pools.get(idx) {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     let cap_hint = self
                         .cfg
                         .as_ref()
@@ -721,7 +741,11 @@ impl GeyserPlugin for Ultra {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     let cap_hint = self
                         .cfg
                         .as_ref()

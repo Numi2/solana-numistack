@@ -30,10 +30,16 @@ pub const FRAME_VERSION: u8 = 1;
 const FRAME_HEADER_TEMPLATE: [u8; 12] = [
     FRAME_VERSION, // version
     0,             // flags
-    0, 0,          // type
-    0, 0, 0, 0,    // len
-    0, 0,          // hdr_crc16
-    0, 0,          // reserved
+    0,
+    0, // type
+    0,
+    0,
+    0,
+    0, // len
+    0,
+    0, // hdr_crc16
+    0,
+    0, // reserved
 ];
 
 fn crc16_ccitt(data: &[u8]) -> u16 {
@@ -319,9 +325,9 @@ pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {
 }
 
 #[cfg(feature = "rkyv")]
-pub fn decode_record_archived_from_slice<'a>(
-    src: &'a [u8],
-) -> Result<(&'a ArchivedRecord, usize), StreamError> {
+pub fn decode_record_archived_from_slice(
+    src: &[u8],
+) -> Result<(&ArchivedRecord, usize), StreamError> {
     if src.len() < 12 {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }
@@ -352,9 +358,9 @@ pub fn decode_record_archived_from_slice<'a>(
 
 #[cfg(feature = "rkyv")]
 /// Trusted zero-copy rkyv decode: skips bytecheck validation. Use only when both ends are trusted.
-pub fn decode_record_archived_trusted_from_slice<'a>(
-    src: &'a [u8],
-) -> Result<(&'a ArchivedRecord, usize), StreamError> {
+pub fn decode_record_archived_trusted_from_slice(
+    src: &[u8],
+) -> Result<(&ArchivedRecord, usize), StreamError> {
     if src.len() < 12 {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }

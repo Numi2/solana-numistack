@@ -1,6 +1,4 @@
-use crate::pool::PooledBuf;
-use crate::queue::Producer;
-use metrics::{counter, gauge};
+use metrics::counter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -96,7 +94,6 @@ impl Meter {
 
 pub fn spawn_flusher(
     meter: Arc<Meter>,
-    producers: Vec<Producer<PooledBuf>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<thread::JoinHandle<()>> {
     match thread::Builder::new()
@@ -172,17 +169,6 @@ pub fn spawn_flusher(
                 if dr > 0 {
                     counter!("ultra_reconnects_total").increment(dr);
                 }
-
-                // Queue depth gauges
-                let mut max_depth = 0u64;
-                for p in &producers {
-                    let d = p.len() as u64;
-                    if d > max_depth {
-                        max_depth = d;
-                    }
-                }
-                gauge!("ultra_queue_len").set(max_depth as f64);
-                meter.observe_queue_depth_max(max_depth);
 
                 prev_enq = cur_enq;
                 prev_drp_qf = cur_drp_qf;

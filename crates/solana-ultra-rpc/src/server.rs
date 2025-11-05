@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::thread::JoinHandle as ThreadJoinHandle;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use axum::{extract::State, http::StatusCode, routing::get, Router};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

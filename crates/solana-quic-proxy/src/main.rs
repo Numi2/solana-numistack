@@ -10,9 +10,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use bytes::{BufMut, BytesMut};
 use clap::Parser;
-use serde::ser::SerializeStruct;
+use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use solana_quic_proxy::{
     client::{ProxyError, QuicRpcClient},
@@ -22,7 +21,7 @@ use solana_quic_proxy::{
 use tokio::signal;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
- 
+
 use serde_json::Serializer as JsonSerializer;
 
 #[derive(Clone)]
@@ -175,22 +174,18 @@ fn status_for_error(err: &ProxyError) -> StatusCode {
 }
 
 fn json_rpc_error_bytes(code: i64, message: &str) -> Bytes {
-    let mut buf = BytesMut::with_capacity(128 + message.len());
-    {
-        let mut writer = buf.writer();
-        let mut serializer = JsonSerializer::new(&mut writer);
-        let mut obj = serializer
-            .serialize_struct("JsonRpcResponse", 3)
-            .expect("serialize_struct to memory cannot fail");
-        obj.serialize_field("jsonrpc", "2.0")
-            .expect("writing jsonrpc field");
-        obj.serialize_field("error", &JsonRpcErrorPayload { code, message })
-            .expect("writing error field");
-        obj.serialize_field("id", &())
-            .expect("writing id field");
-        obj.end().expect("finalize struct");
-    }
-    buf.freeze()
+    let mut buf = Vec::with_capacity(128 + message.len());
+    let mut serializer = JsonSerializer::new(&mut buf);
+    let mut obj = serializer
+        .serialize_struct("JsonRpcResponse", 3)
+        .expect("serialize_struct to memory cannot fail");
+    obj.serialize_field("jsonrpc", "2.0")
+        .expect("writing jsonrpc field");
+    obj.serialize_field("error", &JsonRpcErrorPayload { code, message })
+        .expect("writing error field");
+    obj.serialize_field("id", &()).expect("writing id field");
+    obj.end().expect("finalize struct");
+    Bytes::from(buf)
 }
 
 #[derive(Serialize)]

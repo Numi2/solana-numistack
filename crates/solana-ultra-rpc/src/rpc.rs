@@ -84,10 +84,7 @@ impl RpcRouter {
         }
     }
 
-    async fn get_account_info(
-        &self,
-        params: Option<&RawValue>,
-    ) -> Result<RpcResult, RpcCallError> {
+    async fn get_account_info(&self, params: Option<&RawValue>) -> Result<RpcResult, RpcCallError> {
         let start = Instant::now();
         let (pubkey, cfg) = match parse_account_params(params) {
             Ok(v) => v,
@@ -241,7 +238,8 @@ impl RpcRouter {
                 let shard = &snapshot[shard_idx];
                 for (res_idx, key) in bucket {
                     if let Some(record) = shard.get(&key) {
-                        results[res_idx] = Some(account_to_response_with_slice(record.as_ref(), Some(slice)));
+                        results[res_idx] =
+                            Some(account_to_response_with_slice(record.as_ref(), Some(slice)));
                     }
                 }
             }

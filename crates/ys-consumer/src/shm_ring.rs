@@ -1,6 +1,6 @@
 // Numan Thabit 2025
 // crates/ys-consumer/src/shm_ring.rs
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 use memmap2::{MmapMut, MmapOptions};
 use metrics::counter;
 use std::fs::OpenOptions;
@@ -44,8 +44,27 @@ fn write_u64_le(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+#[inline]
+#[allow(unsafe_code)]
+fn map_writable_with_len(file: &std::fs::File, total: usize) -> io::Result<MmapMut> {
+    // Ensure file is large enough for requested mapping length
+    let curr_len = file.metadata()?.len();
+    if curr_len < total as u64 {
+        file.set_len(total as u64)?;
+    }
+    if total == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mapping length must be > 0",
+        ));
+    }
+    // SAFETY: offset is 0 and length <= file length (ensured above). The FD is opened read+write.
+    let mmap = unsafe { MmapOptions::new().len(total).map_mut(file)? };
+    Ok(mmap)
+}
+
 pub struct ShmRingWriter {
-    path: PathBuf,
+    _path: PathBuf,
     mmap: MmapMut,
     cap: usize,
 }
@@ -57,10 +76,10 @@ impl ShmRingWriter {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&path)?;
         let total = HDR_LEN + capacity_bytes;
-        file.set_len(total as u64)?;
-        let mut mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
+        let mut mmap = map_writable_with_len(&file, total)?;
         // Initialize header if empty or mismatched
         let magic = read_u32_le(&mmap, 0);
         let version = read_u32_le(&mmap, 4);
@@ -74,7 +93,7 @@ impl ShmRingWriter {
             mmap.flush()?;
         }
         Ok(Self {
-            path,
+            _path: path,
             mmap,
             cap: capacity_bytes,
         })
@@ -140,15 +159,11 @@ impl ShmRingWriter {
         write_u32_le(&mut self.mmap, off, frame.len() as u32);
         let dst = &mut self.mmap[off + 4..off + 4 + frame.len()];
         dst.copy_from_slice(frame);
-        head = head + need;
+        head += need;
         self.set_head(head);
         counter!("ys_consumer_shm_written_total").increment(1);
         true
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+    
 }
-
-

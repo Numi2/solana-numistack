@@ -16,13 +16,15 @@ impl BufferPool {
         let q = ArrayQueue::new(max_items);
         // Pre-fill and prefault pages to avoid major faults on bursts
         for _ in 0..max_items {
-            let mut v: Vec<u8> = Vec::with_capacity(default_capacity);
-            // Touch each page by resizing, then clear while retaining capacity
-            v.resize(default_capacity, 0);
+            // Prefault pages by allocating zeroed bytes, then clear while retaining capacity
+            let mut v: Vec<u8> = vec![0u8; default_capacity];
             v.clear();
             let _ = q.push(v);
         }
-        let pool = Arc::new(Self { q, default_capacity });
+        let pool = Arc::new(Self {
+            q,
+            default_capacity,
+        });
         gauge!("ultra_pool_len").set(pool.q.len() as f64);
         gauge!("ultra_pool_cap_bytes").set(default_capacity as f64);
         pool

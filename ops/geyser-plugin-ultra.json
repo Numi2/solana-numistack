@@ -1,16 +1,23 @@
 
 {
-    "libpath": "/usr/local/lib/libgeyser_plugin_ultra.so",
-    "socket_path": "/var/run/ultra-geyser.sock",
-  "queue_capacity": 65536,
-  "batch_max": 512,
+  "libpath": "/usr/local/lib/libgeyser_plugin_ultra.so",
+  "socket_path": "/var/run/ultra-geyser.sock",
+  "queue_capacity": 8192,
+  "queue_drop_policy": "drop_newest",
+  "batch_max": 64,
   "batch_bytes_max": 1048576,
-  "flush_after_ms": 1,
-    "streams": {
-      "accounts": true,
-      "transactions": true,
-      "blocks": true,
-      "slots": true
-    },
-    "metrics": { "listen_addr": "0.0.0.0:9977" }
-  }
+  "flush_after_ms": 0,
+  "write_timeout_ms": 200,
+  "pin_core": 2,
+  "rt_priority": 90,
+  "sched_policy": "fifo",
+  "histogram_sample_log2": 8,
+  "streams": {
+    "accounts": true,
+    "transactions": true,
+    "blocks": true,
+    "slots": true
+  },
+  "writer_threads": 4,
+  "metrics": { "listen_addr": "0.0.0.0:9977" }
+}

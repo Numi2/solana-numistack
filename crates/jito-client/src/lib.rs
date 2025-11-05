@@ -101,6 +101,7 @@ pub struct JitoClientBuilder {
     retry_max_retries: u32,
     retry_initial_ms: u64,
     retry_max_ms: u64,
+    retry_jitter_ms: u64,
 }
 
 impl JitoClientBuilder {
@@ -148,6 +149,7 @@ impl JitoClientBuilder {
             retry_max_retries: env_u32("JITO_RETRIES", 5),
             retry_initial_ms: env_u64("JITO_RETRY_INITIAL_MS", 100),
             retry_max_ms: env_u64("JITO_RETRY_MAX_MS", 3_000),
+            retry_jitter_ms: env_u64("JITO_RETRY_JITTER_MS", 13),
         }
     }
 
@@ -196,6 +198,11 @@ impl JitoClientBuilder {
         self
     }
 
+    pub fn retry_jitter(mut self, jitter_ms: u64) -> Self {
+        self.retry_jitter_ms = jitter_ms;
+        self
+    }
+
     #[instrument(name = "jito_client_connect", skip(self))]
     pub async fn connect(self) -> Result<JitoClient> {
         // Validate endpoint early
@@ -230,6 +237,7 @@ impl JitoClientBuilder {
             max_retries: self.retry_max_retries,
             initial_backoff_ms: self.retry_initial_ms,
             max_backoff_ms: self.retry_max_ms,
+            fixed_jitter_ms: self.retry_jitter_ms,
         };
 
         JitoClient::connect_with_config_and_retry(cfg, retry).await
@@ -270,7 +278,10 @@ impl JitoClient {
                         return Err(Error::Transport(err));
                     }
                     attempt += 1;
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    sleep(Duration::from_millis(
+                        backoff_ms.saturating_add(retry.fixed_jitter_ms),
+                    ))
+                    .await;
                     backoff_ms = (backoff_ms.saturating_mul(2)).min(retry.max_backoff_ms.max(1));
                 }
             }
@@ -332,6 +343,7 @@ impl JitoClient {
             if let Some(auth) = self.shared.config.bearer.clone() {
                 req.metadata_mut().insert("authorization", auth);
             }
+            req.set_timeout(self.shared.config.rpc_timeout);
             match self.inner.get_tip_accounts(req).await {
                 Ok(resp) => return Ok(resp.into_inner().accounts),
                 Err(status) => {
@@ -345,7 +357,10 @@ impl JitoClient {
                     ) {
                         let _ = self.reconnect_in_place().await;
                     }
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    sleep(Duration::from_millis(
+                        backoff_ms.saturating_add(self.shared.retry.fixed_jitter_ms),
+                    ))
+                    .await;
                     backoff_ms =
                         (backoff_ms.saturating_mul(2)).min(self.shared.retry.max_backoff_ms);
                 }
@@ -391,16 +406,56 @@ impl JitoClient {
     }
 
     pub async fn send_bundle(&mut self, bundle: Bundle) -> Result<String> {
+        const HEDGE_DELAY_MS: u64 = 15;
         let mut attempt: u32 = 0;
         let mut backoff_ms = self.shared.retry.initial_backoff_ms;
         loop {
-            let mut request = Request::new(SendBundleRequest {
+            // Build primary request with per-request deadline
+            let mut req_primary = Request::new(SendBundleRequest {
                 bundle: Some(bundle.clone()),
             });
             if let Some(auth) = self.shared.config.bearer.clone() {
-                request.metadata_mut().insert("authorization", auth);
+                req_primary.metadata_mut().insert("authorization", auth);
             }
-            match self.inner.send_bundle(request).await {
+            req_primary.set_timeout(self.shared.config.rpc_timeout);
+
+            // Clone client for primary path
+            let mut primary_client = self.inner.clone();
+
+            // Prepare secondary (hedged) future with a separate channel
+            let cfg = self.shared.config.clone();
+            let endpoint = self.shared.endpoint.clone();
+            let retry = self.shared.retry.clone();
+            let mut req_secondary = Request::new(SendBundleRequest {
+                bundle: Some(bundle.clone()),
+            });
+            if let Some(auth) = self.shared.config.bearer.clone() {
+                req_secondary.metadata_mut().insert("authorization", auth);
+            }
+            req_secondary.set_timeout(self.shared.config.rpc_timeout);
+
+            let secondary_fut = async move {
+                sleep(Duration::from_millis(HEDGE_DELAY_MS)).await;
+                // Try to dial a fresh channel for true hedging
+                match JitoClient::dial_channel(&endpoint, &retry).await {
+                    Ok(ch) => {
+                        let mut client = JitoClient::make_client(ch, &cfg);
+                        client.send_bundle(req_secondary).await
+                    }
+                    Err(e) => Err(tonic::Status::unavailable(format!(
+                        "hedge dial failed: {}",
+                        e
+                    ))),
+                }
+            };
+
+            // Race primary vs secondary
+            let res = tokio::select! {
+                r = primary_client.send_bundle(req_primary) => r,
+                r = secondary_fut => r,
+            };
+
+            match res {
                 Ok(resp) => return Ok(resp.into_inner().uuid),
                 Err(status) => {
                     if !is_retryable(status.code()) || attempt >= self.shared.retry.max_retries {
@@ -413,7 +468,10 @@ impl JitoClient {
                     ) {
                         let _ = self.reconnect_in_place().await;
                     }
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    sleep(Duration::from_millis(
+                        backoff_ms.saturating_add(self.shared.retry.fixed_jitter_ms),
+                    ))
+                    .await;
                     backoff_ms =
                         (backoff_ms.saturating_mul(2)).min(self.shared.retry.max_backoff_ms);
                 }
@@ -447,7 +505,10 @@ impl JitoClient {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
-                        sleep(Duration::from_millis(backoff_ms)).await;
+                        sleep(Duration::from_millis(
+                            backoff_ms.saturating_add(shared.retry.fixed_jitter_ms),
+                        ))
+                        .await;
                         backoff_ms =
                             (backoff_ms.saturating_mul(2)).min(shared.retry.max_backoff_ms);
                         continue;
@@ -463,7 +524,10 @@ impl JitoClient {
                     }
                     Err(status) => {
                         let _ = tx.send(Err(status.into())).await;
-                        sleep(Duration::from_millis(backoff_ms)).await;
+                        sleep(Duration::from_millis(
+                            backoff_ms.saturating_add(shared.retry.fixed_jitter_ms),
+                        ))
+                        .await;
                         backoff_ms =
                             (backoff_ms.saturating_mul(2)).min(shared.retry.max_backoff_ms);
                         continue;
@@ -488,7 +552,10 @@ impl JitoClient {
                     }
                 }
                 // EOF or channel closed → reconnect with backoff
-                sleep(Duration::from_millis(backoff_ms)).await;
+                sleep(Duration::from_millis(
+                    backoff_ms.saturating_add(shared.retry.fixed_jitter_ms),
+                ))
+                .await;
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(shared.retry.max_backoff_ms);
             }
         });
@@ -510,6 +577,7 @@ struct RetryConfig {
     max_retries: u32,
     initial_backoff_ms: u64,
     max_backoff_ms: u64,
+    fixed_jitter_ms: u64,
 }
 
 fn is_retryable(code: tonic::Code) -> bool {

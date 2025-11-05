@@ -3,15 +3,17 @@
     "socket_path": "/var/run/ultra-geyser.sock",
     "queue_capacity": 8192,
     "batch_max": 256,
-    "batch_bytes_max": 2097152,
+    "batch_bytes_max": 65536,
     "flush_after_ms": 0,
     "write_timeout_ms": 200,
     "pin_core": 2,
     "rt_priority": 80,
     "sched_policy": "fifo",
     "histogram_sample_log2": 8,
+    "shed_throttle_ms": 500,
     "streams": { "accounts": true, "transactions": true, "blocks": true, "slots": true },
     "metrics": { "listen_addr": "0.0.0.0:9977" },
     "pool_items_max": 32,
-    "memory_budget_bytes": 33554432
+    "memory_budget_bytes": 33554432,
+    "writer_threads": 4
 }

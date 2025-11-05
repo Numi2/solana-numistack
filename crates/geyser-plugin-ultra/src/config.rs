@@ -56,6 +56,8 @@ pub struct Config {
     pub memory_budget_bytes: Option<usize>,
     #[serde(default = "default_writer_threads")]
     pub writer_threads: usize,
+    #[serde(default = "default_shed_throttle_ms")]
+    pub shed_throttle_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -79,7 +81,8 @@ fn default_batch() -> usize {
     512
 }
 fn default_batch_bytes() -> usize {
-    2 * 1024 * 1024
+    // Target UDS syscall payload ~64 KiB by default
+    64 * 1024
 }
 fn default_flush_after_ms() -> u64 {
     0
@@ -107,6 +110,10 @@ fn default_writer_threads() -> usize {
     1
 }
 
+fn default_shed_throttle_ms() -> u64 {
+    500
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
     pub socket_path: PathBuf,
@@ -128,6 +135,7 @@ pub struct ValidatedConfig {
     pub pool_items_max: usize,
     pub pool_default_cap: usize,
     pub writer_threads: usize,
+    pub shed_throttle_ms: u64,
 }
 
 impl Config {
@@ -180,6 +188,11 @@ impl Config {
             ));
         }
 
+        // For UDS writers, keep batch_bytes_max within ~48–64 KiB to avoid pathological packetization
+        let recommended_min = 48 * 1024usize;
+        let recommended_max = 64 * 1024usize;
+        let batch_bytes_max = self.batch_bytes_max.clamp(recommended_min, recommended_max);
+
         // pool sizing
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -193,7 +206,7 @@ impl Config {
                 pool_items_max
             ));
         }
-        let pool_default_cap = std::cmp::min(self.batch_bytes_max, ONE_MIB);
+        let pool_default_cap = std::cmp::min(batch_bytes_max, ONE_MIB);
 
         // optional memory budget
         if let Some(budget) = self.memory_budget_bytes {
@@ -223,7 +236,7 @@ impl Config {
             socket_path,
             queue_capacity,
             batch_max: self.batch_max,
-            batch_bytes_max: self.batch_bytes_max,
+            batch_bytes_max,
             flush_after_ms: self.flush_after_ms,
             write_timeout_ms: self.write_timeout_ms,
             #[cfg(target_os = "linux")]
@@ -239,6 +252,7 @@ impl Config {
             pool_default_cap,
             writer_threads: self.writer_threads,
             queue_drop_policy: self.queue_drop_policy,
+            shed_throttle_ms: self.shed_throttle_ms,
         })
     }
 }

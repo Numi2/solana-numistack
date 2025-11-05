@@ -3,6 +3,13 @@
   "uds_path": "/var/run/ultra-geyser.sock",
   "stdout_json": false,
   "metrics_addr": "0.0.0.0:9978",
-  "uds_recv_buf_bytes": 33554432
+  "uds_recv_buf_bytes": 33554432,
+  "listeners": [
+    {
+      "uds_path": "/var/run/ultra-geyser.sock",
+      "uds_recv_buf_bytes": 33554432,
+      "max_frame_bytes": 16777216
+    }
+  ]
 
 }

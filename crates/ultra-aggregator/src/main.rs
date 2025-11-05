@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
+use tokio::time::{self, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -31,14 +32,26 @@ struct KafkaCfg {
 
 // json_view removed: replaced with JsonEvent pipeline
 #[derive(Debug, Clone, serde::Deserialize)]
+struct SocketCfg {
+    uds_path: String,
+    // Optional tuning knob: requested socket recv buffer size
+    uds_recv_buf_bytes: Option<usize>,
+    // Optional safety bound: drop frames larger than this many bytes to avoid OOM
+    max_frame_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 struct Cfg {
+    // Back-compat: single-listener config
     uds_path: String,
     stdout_json: bool,
     metrics_addr: Option<String>,
     // Optional tuning knob: requested socket recv buffer size
     uds_recv_buf_bytes: Option<usize>,
-    // Optional safety bound: drop frames larger than this many bytes to avoid OOM
+    // Optional safety bound: drop frames larger than this many bytes to avoid OOM (back-compat)
     max_frame_bytes: Option<usize>,
+    // New: multi-listener with per-socket overrides
+    listeners: Option<Vec<SocketCfg>>,
     #[cfg(feature = "kafka")]
     kafka: Option<KafkaCfg>,
 }
@@ -174,7 +187,7 @@ enum JsonEvent {
     EndOfStartup,
 }
 
-fn json_event_from_record(rec: &Record) -> JsonEvent {
+fn json_event_owned_from_record(rec: &Record) -> JsonEvent {
     match rec {
         Record::Account(a) => JsonEvent::Account {
             slot: a.slot,
@@ -337,6 +350,8 @@ fn write_json_event<W: Write>(
     }
 }
 
+static RESYNC_EVENTS_THIS_MINUTE: AtomicU64 = AtomicU64::new(0);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -357,19 +372,26 @@ async fn main() -> Result<()> {
             .install();
     }
 
-    if Path::new(&cfg.uds_path).exists() {
-        let _ = std::fs::remove_file(&cfg.uds_path);
-    }
-    let listener = UnixListener::bind(&cfg.uds_path)?;
-    // best-effort: set perms to 0660 for controlled access
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(_meta) = std::fs::metadata(&cfg.uds_path) {
-            let _ = std::fs::set_permissions(&cfg.uds_path, std::fs::Permissions::from_mode(0o660));
+    // Export a per-minute gauge for resync events
+    tokio::spawn(async move {
+        let mut tick = time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let n = RESYNC_EVENTS_THIS_MINUTE.swap(0, Ordering::Relaxed);
+            gauge!("ultra_resync_events_per_minute").set(n as f64);
         }
-    }
-    info!("listening UDS {}", cfg.uds_path);
+    });
+
+    // Construct listeners list (multi-listener support with per-socket overrides)
+    let listeners_cfg: Vec<SocketCfg> = if let Some(list) = cfg.listeners.clone() {
+        list
+    } else {
+        vec![SocketCfg {
+            uds_path: cfg.uds_path.clone(),
+            uds_recv_buf_bytes: cfg.uds_recv_buf_bytes,
+            max_frame_bytes: cfg.max_frame_bytes,
+        }]
+    };
 
     #[cfg(feature = "kafka")]
     let kafka_sink = if let Some(k) = cfg.kafka.clone() {
@@ -387,44 +409,80 @@ async fn main() -> Result<()> {
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                info!("shutting down");
-                break;
+    // Spawn one accept loop per listener
+    for s in listeners_cfg {
+        let json_clone = json_sink.clone();
+        let default_recv = cfg.uds_recv_buf_bytes;
+        let default_mfb = cfg.max_frame_bytes;
+        #[cfg(feature = "kafka")]
+        let ks = kafka_sink.clone();
+        tokio::spawn(async move {
+            let uds_path = s.uds_path.clone();
+            if Path::new(&uds_path).exists() {
+                let _ = std::fs::remove_file(&uds_path);
             }
-            Ok((sock, _)) = listener.accept() => {
-                // Best-effort: enlarge recv buffer on accepted socket
-                #[cfg(unix)] {
-                    let requested = cfg.uds_recv_buf_bytes.unwrap_or(32 * 1024 * 1024);
-                    let sr = SockRef::from(&sock);
-                    let _ = sr.set_recv_buffer_size(requested);
-                    if let Ok(actual) = sr.recv_buffer_size() {
-                        info!("UDS recv buffer set: requested={} actual={}", requested, actual);
-                        gauge!("ultra_uds_recv_buf_bytes").set(actual as f64);
+            let listener = match UnixListener::bind(&uds_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("failed to bind {}: {e}", uds_path);
+                    return;
+                }
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(_meta) = std::fs::metadata(&uds_path) {
+                    let _ =
+                        std::fs::set_permissions(&uds_path, std::fs::Permissions::from_mode(0o660));
+                }
+            }
+            info!("listening UDS {}", uds_path);
+
+            let recv_req = s
+                .uds_recv_buf_bytes
+                .or(default_recv)
+                .unwrap_or(32 * 1024 * 1024);
+            let max_frame_bytes = s
+                .max_frame_bytes
+                .or(default_mfb)
+                .unwrap_or(16 * 1024 * 1024);
+
+            loop {
+                tokio::select! {
+                    Ok((sock, _)) = listener.accept() => {
+                        #[cfg(unix)] {
+                            let sr = SockRef::from(&sock);
+                            let _ = sr.set_recv_buffer_size(recv_req);
+                            if let Ok(actual) = sr.recv_buffer_size() {
+                                info!("UDS recv buffer set: requested={} actual={}", recv_req, actual);
+                                gauge!("ultra_uds_recv_buf_bytes").set(actual as f64);
+                            }
+                        }
+                        let json_clone2 = json_clone.clone();
+                        #[cfg(feature = "kafka")] {
+                            let ks2 = ks.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_client(sock, json_clone2, max_frame_bytes, ks2).await {
+                                    error!("client error: {e:?}");
+                                }
+                            });
+                        }
+                        #[cfg(not(feature = "kafka"))] {
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_client(sock, json_clone2, max_frame_bytes).await {
+                                    error!("client error: {e:?}");
+                                }
+                            });
+                        }
                     }
                 }
-                let json_clone = json_sink.clone();
-                #[cfg(feature = "kafka")] {
-                    let ks = kafka_sink.clone();
-                    let max_frame_bytes = cfg.max_frame_bytes.unwrap_or(16 * 1024 * 1024);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client(sock, json_clone, max_frame_bytes, ks).await {
-                            error!("client error: {e:?}");
-                        }
-                    });
-                }
-                #[cfg(not(feature = "kafka"))] {
-                    let max_frame_bytes = cfg.max_frame_bytes.unwrap_or(16 * 1024 * 1024);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client(sock, json_clone, max_frame_bytes).await {
-                            error!("client error: {e:?}");
-                        }
-                    });
-                }
             }
-        }
+        });
     }
+
+    // Wait for shutdown signal
+    let _ = shutdown.as_mut().await;
+    info!("shutting down");
     Ok(())
 }
 
@@ -451,6 +509,8 @@ async fn handle_client(
                 let ver = u16::from_be_bytes([buf[4], buf[5]]);
                 if magic != faststreams::FRAME_MAGIC || ver != faststreams::FRAME_VERSION {
                     counter!("ultra_decode_bad_header_total").increment(1);
+                    counter!("ultra_resync_events_total").increment(1);
+                    RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
                     let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
                     if let Some(idx) = memchr::memmem::find(&buf[..], &magic_bytes) {
                         if idx > 0 {
@@ -464,6 +524,8 @@ async fn handle_client(
                 let len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
                 if len > max_frame_bytes {
                     counter!("ultra_frame_too_large_total").increment(1);
+                    counter!("ultra_resync_events_total").increment(1);
+                    RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
                     // Resync by searching for the next magic after the current one to avoid re-parsing the same header
                     let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
                     if let Some(rel) = memchr::memmem::find(&buf[4..], &magic_bytes) {
@@ -478,7 +540,7 @@ async fn handle_client(
                 Ok(rec_and_len) => {
                     let (rec, consumed) = rec_and_len;
                     if let Some(js) = &json {
-                        let evt = json_event_from_record(&rec);
+                        let evt = json_event_owned_from_record(&rec);
                         if !js.try_send(evt) {
                             counter!("ultra_json_dropped_total").increment(1);
                         }
@@ -495,6 +557,8 @@ async fn handle_client(
                 }
                 Err(faststreams::StreamError::BadHeader) => {
                     counter!("ultra_decode_bad_header_total").increment(1);
+                    counter!("ultra_resync_events_total").increment(1);
+                    RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
                     // scan for next magic to resync
                     let magic = faststreams::FRAME_MAGIC.to_be_bytes();
                     if let Some(idx) = memchr::memmem::find(&buf[..], &magic) {

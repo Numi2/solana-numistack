@@ -148,32 +148,8 @@ impl StreamBuffers {
 
     async fn read_payload(&mut self, recv: &mut quinn::RecvStream, len: usize) -> Result<()> {
         self.payload.clear();
-        self.payload.reserve(len);
-        let mut remaining = len;
-        while remaining > 0 {
-            match recv.read_chunk(remaining, true).await? {
-                Some(chunk) => {
-                    let bytes = chunk.bytes;
-                    let count = bytes.len();
-                    if count == 0 {
-                        continue;
-                    }
-                    if count > remaining {
-                        anyhow::bail!(
-                            "received frame overflow: chunk {count} exceeds remaining {remaining}"
-                        );
-                    }
-                    remaining -= count;
-                    self.payload.extend_from_slice(&bytes);
-                }
-                None => {
-                    let received = len - remaining;
-                    anyhow::bail!(
-                        "frame truncated: expected {len} bytes, received only {received} bytes"
-                    );
-                }
-            }
-        }
+        self.payload.resize(len, 0);
+        recv.read_exact(&mut self.payload).await?;
         Ok(())
     }
 }

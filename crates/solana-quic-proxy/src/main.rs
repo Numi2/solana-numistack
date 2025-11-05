@@ -168,7 +168,9 @@ fn status_for_error(err: &ProxyError) -> StatusCode {
         ProxyError::ResponseTooLarge { .. } => StatusCode::BAD_GATEWAY,
         ProxyError::Connect(_) => StatusCode::BAD_GATEWAY,
         ProxyError::Connection(_) => StatusCode::BAD_GATEWAY,
-        ProxyError::Write(_) | ProxyError::Read(_) => StatusCode::BAD_GATEWAY,
+        ProxyError::Write(_) | ProxyError::IoWrite(_) | ProxyError::Read(_) => {
+            StatusCode::BAD_GATEWAY
+        }
         ProxyError::Protocol(_) => StatusCode::BAD_GATEWAY,
     }
 }

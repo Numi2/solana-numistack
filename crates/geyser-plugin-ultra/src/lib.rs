@@ -1,7 +1,9 @@
 // Numan Thabit 2025
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
+mod affinity;
 mod config;
+mod meter;
 mod pool;
 mod queue;
 mod writer;
@@ -21,6 +23,7 @@ use parking_lot::Mutex;
 use queue::{Producer, SpscRing};
 use tracing::debug;
 // no direct imports
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::raw::c_void;
@@ -40,11 +43,9 @@ struct Ultra {
     metrics_seq: AtomicU64,
     writer_handles: Vec<thread::JoinHandle<()>>,
     metrics_handle: Option<PrometheusHandle>,
-    enqueued_total: AtomicU64,
-    dropped_total: AtomicU64,
-    encode_error_total: AtomicU64,
-    queue_depth_max: Arc<AtomicU64>,
-    processed_total: Arc<AtomicU64>,
+    meter: Arc<meter::Meter>,
+    metrics_flusher: Option<thread::JoinHandle<()>>,
+    shed_accounts_until: Mutex<HashMap<[u8; 32], std::time::Instant>>,
 }
 
 #[derive(Debug)]
@@ -81,11 +82,9 @@ impl Ultra {
             metrics_seq: AtomicU64::new(0),
             writer_handles: Vec::new(),
             metrics_handle: None,
-            enqueued_total: AtomicU64::new(0),
-            dropped_total: AtomicU64::new(0),
-            encode_error_total: AtomicU64::new(0),
-            queue_depth_max: Arc::new(AtomicU64::new(0)),
-            processed_total: Arc::new(AtomicU64::new(0)),
+            meter: Arc::new(meter::Meter::default()),
+            metrics_flusher: None,
+            shed_accounts_until: Mutex::new(HashMap::new()),
         }
     }
 
@@ -146,43 +145,61 @@ impl Ultra {
     }
 
     fn record_enqueue_success(&self) {
-        self.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-        if (v & 0xFF) == 0 {
-            counter!("ultra_enqueued_total").increment(256);
-        }
+        self.meter.inc_enqueued(1);
     }
 
     fn record_drop_sampled(&self, reason: &'static str) {
-        self.dropped_total.fetch_add(1, Ordering::Relaxed);
-        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-        if (v & 0xFF) == 0 {
-            counter!("ultra_dropped_total", "reason" => reason).increment(256);
+        match reason {
+            "queue_full" => self.meter.inc_dropped_queue_full(1),
+            "no_buf" => self.meter.inc_dropped_no_buf(1),
+            _ => self.meter.inc_dropped_queue_full(1),
         }
     }
 
     fn record_drop_unsampled(&self, reason: &'static str) {
-        self.dropped_total.fetch_add(1, Ordering::Relaxed);
-        counter!("ultra_dropped_total", "reason" => reason).increment(1);
+        match reason {
+            "queue_full" => self.meter.inc_dropped_queue_full(1),
+            "no_buf" => self.meter.inc_dropped_no_buf(1),
+            _ => self.meter.inc_dropped_queue_full(1),
+        }
     }
 
     fn record_queue_depth(&self, idx: usize) {
         if let Some(producer) = self.producers.get(idx) {
             let depth = producer.len() as u64;
-            gauge!("ultra_queue_len").set(depth as f64);
-            let mut cur = self.queue_depth_max.load(Ordering::Relaxed);
-            while depth > cur {
-                match self.queue_depth_max.compare_exchange(
-                    cur,
-                    depth,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => cur = actual,
-                }
-            }
+            self.meter.observe_queue_depth_max(depth);
         }
+    }
+
+    #[inline]
+    fn shed_accounts_ttl_ms(&self) -> u64 {
+        self.cfg.as_ref().map(|c| c.shed_throttle_ms).unwrap_or(500)
+    }
+
+    #[inline]
+    fn mark_shed_account(&self, pk: [u8; 32]) {
+        let ttl = self.shed_accounts_ttl_ms();
+        if ttl == 0 {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ttl);
+        let mut map = self.shed_accounts_until.lock();
+        map.insert(pk, until);
+        counter!("ultra_shed_total", "action" => "mark").increment(1);
+    }
+
+    #[inline]
+    fn is_account_shed(&self, pk: &[u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.shed_accounts_until.lock();
+        if let Some(until) = map.get(pk).cloned() {
+            if now >= until {
+                map.remove(pk);
+                return false;
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -257,17 +274,18 @@ impl GeyserPlugin for Ultra {
 
         let mut producers = Vec::with_capacity(cfg.writer_threads);
         let mut handles = Vec::with_capacity(cfg.writer_threads);
+        let core_ids = affinity::select_writer_core_ids(&cfg, cfg.writer_threads);
         for writer_idx in 0..cfg.writer_threads {
             let ring = SpscRing::with_capacity(cfg.queue_capacity);
             let (producer, consumer) = ring.split();
             let writer_cfg = cfg.clone();
             let shutdown = Arc::clone(&self.shutdown);
-            let qmax = Arc::clone(&self.queue_depth_max);
-            let processed = Arc::clone(&self.processed_total);
+            let meter = Arc::clone(&self.meter);
+            let core_aff = core_ids.get(writer_idx).cloned();
             let handle = thread::Builder::new()
                 .name(format!("ultra-writer-{writer_idx}"))
                 .spawn(move || {
-                    writer::run_writer(writer_idx, writer_cfg, consumer, &shutdown, qmax, processed)
+                    writer::run_writer(writer_idx, writer_cfg, consumer, &shutdown, meter, core_aff)
                 })
                 .map_err(|e| GeyserPluginError::Custom(Box::new(PluginError(e.to_string()))))?;
             producers.push(producer);
@@ -280,11 +298,25 @@ impl GeyserPlugin for Ultra {
         self.pool = Some(pool);
         self.writer_handles = handles;
 
+        // Spawn low-priority metrics flusher if metrics exporter enabled
+        if self.metrics_handle.is_some() {
+            if let Some(flusher) = meter::spawn_flusher(
+                Arc::clone(&self.meter),
+                self.producers.clone(),
+                Arc::clone(&self.shutdown),
+            ) {
+                self.metrics_flusher = Some(flusher);
+            }
+        }
+
         Ok(())
     }
 
     fn on_unload(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.metrics_flusher.take() {
+            let _ = join_with_timeout(handle, std::time::Duration::from_secs(2));
+        }
         self.producers.clear();
         let mut handles = Vec::new();
         std::mem::swap(&mut handles, &mut self.writer_handles);
@@ -293,12 +325,23 @@ impl GeyserPlugin for Ultra {
                 log::error!("ultra: writer {idx} did not terminate within timeout");
             }
         }
-        let enq = self.enqueued_total.load(Ordering::Relaxed);
-        let drp = self.dropped_total.load(Ordering::Relaxed);
-        let enc_err = self.encode_error_total.load(Ordering::Relaxed);
-        let qmax = self.queue_depth_max.load(Ordering::Relaxed);
-        let processed = self.processed_total.load(Ordering::Relaxed);
-        log::info!("ultra: unload summary processed={} enqueued={} dropped={} encode_errors={} max_queue_len={}", processed, enq, drp, enc_err, qmax);
+        let enq = self.meter.enqueued_total.load(Ordering::Relaxed);
+        let drp = self.meter.dropped_queue_full_total.load(Ordering::Relaxed)
+            + self.meter.dropped_no_buf_total.load(Ordering::Relaxed);
+        let enc_err = self
+            .meter
+            .encode_error_account_total
+            .load(Ordering::Relaxed)
+            + self.meter.encode_error_tx_total.load(Ordering::Relaxed)
+            + self.meter.encode_error_block_total.load(Ordering::Relaxed)
+            + self.meter.encode_error_slot_total.load(Ordering::Relaxed)
+            + self.meter.encode_error_eos_total.load(Ordering::Relaxed);
+        let qmax = self.meter.queue_depth_max.load(Ordering::Relaxed);
+        let processed = self.meter.processed_total.load(Ordering::Relaxed);
+        log::info!(
+            "ultra: unload summary processed={} enqueued={} dropped={} encode_errors={} max_queue_len={}",
+            processed, enq, drp, enc_err, qmax
+        );
     }
 
     fn account_data_notifications_enabled(&self) -> bool {
@@ -341,6 +384,11 @@ impl GeyserPlugin for Ultra {
                 [0u8; 32]
             }
         };
+        // If this account pubkey is currently shed, skip early to throttle upstream work.
+        if self.is_account_shed(&pk_bytes) {
+            counter!("ultra_shed_total", "action" => "skip").increment(1);
+            return Ok(());
+        }
         let owner_bytes = {
             let s: &[u8] = AsRef::<[u8]>::as_ref(&owner);
             if s.len() == 32 {
@@ -364,11 +412,15 @@ impl GeyserPlugin for Ultra {
         if let Some(pool) = &self.pool {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
-                    let t0 = Instant::now();
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     match encode_record_ref_into_with(&aref, buf, EncodeOptions::latency_uds()) {
                         Ok(()) => {
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
+                            if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "account")
                                     .record(t0.elapsed().as_nanos() as f64);
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
@@ -379,6 +431,8 @@ impl GeyserPlugin for Ultra {
                             let idx = match self.writer_index_for_bytes(&pk_bytes) {
                                 Some(i) => i,
                                 None => {
+                                    // No writers; shed this key temporarily to reduce encode pressure.
+                                    self.mark_shed_account(pk_bytes);
                                     self.record_drop_sampled("queue_full");
                                     return Ok(());
                                 }
@@ -395,8 +449,7 @@ impl GeyserPlugin for Ultra {
                             }
                         }
                         Err(e) => {
-                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                            counter!("ultra_encode_error_total", "kind" => "account").increment(1);
+                            self.meter.inc_encode_error_account(1);
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                             if (v & 0xFF) == 0 {
                                 debug!(target = "ultra.encode", "account encode failed: {e}");
@@ -441,11 +494,15 @@ impl GeyserPlugin for Ultra {
         if let Some(pool) = &self.pool {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
-                    let t0 = Instant::now();
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
                         Ok(()) => {
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
+                            if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "tx")
                                     .record(t0.elapsed().as_nanos() as f64);
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
@@ -472,8 +529,7 @@ impl GeyserPlugin for Ultra {
                             }
                         }
                         Err(e) => {
-                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                            counter!("ultra_encode_error_total", "kind" => "tx").increment(1);
+                            self.meter.inc_encode_error_tx(1);
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                             if (v & 0xFF) == 0 {
                                 debug!(target = "ultra.encode", "tx encode failed: {e}");
@@ -504,11 +560,15 @@ impl GeyserPlugin for Ultra {
             if let Some(pool) = &self.pool {
                 if let Some(mut pb) = pool.try_get() {
                     if let Some(buf) = pb.inner_mut() {
-                        let t0 = Instant::now();
+                        let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                        let maybe_t0 = if (v & 0xFF) == 0 {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
                         match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
                             Ok(()) => {
-                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                                if (v & 0xFF) == 0 {
+                                if let Some(t0) = maybe_t0 {
                                     histogram!("ultra_encode_ns", "kind" => "block")
                                         .record(t0.elapsed().as_nanos() as f64);
                                     if let Some(sz) = pb.as_slice().map(|s| s.len()) {
@@ -535,11 +595,8 @@ impl GeyserPlugin for Ultra {
                                 }
                             }
                             Err(e) => {
-                                self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                                counter!("ultra_encode_error_total", "kind" => "block")
-                                    .increment(1);
-                                let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                                if (v & 0xFF) == 0 {
+                                self.meter.inc_encode_error_block(1);
+                                if maybe_t0.is_some() {
                                     debug!(target = "ultra.encode", "block encode failed: {e}");
                                 }
                             }
@@ -579,11 +636,15 @@ impl GeyserPlugin for Ultra {
         if let Some(pool) = &self.pool {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
-                    let t0 = Instant::now();
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
                         Ok(()) => {
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
+                            if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "slot")
                                     .record(t0.elapsed().as_nanos() as f64);
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
@@ -610,10 +671,8 @@ impl GeyserPlugin for Ultra {
                             }
                         }
                         Err(e) => {
-                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                            counter!("ultra_encode_error_total", "kind" => "slot").increment(1);
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
+                            self.meter.inc_encode_error_slot(1);
+                            if maybe_t0.is_some() {
                                 debug!(target = "ultra.encode", "slot encode failed: {e}");
                             }
                         }
@@ -630,12 +689,16 @@ impl GeyserPlugin for Ultra {
         if let Some(pool) = &self.pool {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
-                    let t0 = Instant::now();
+                    let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
+                    let maybe_t0 = if (v & 0xFF) == 0 {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     match encode_into_with(&Record::EndOfStartup, buf, EncodeOptions::latency_uds())
                     {
                         Ok(()) => {
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
+                            if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "eos")
                                     .record(t0.elapsed().as_nanos() as f64);
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
@@ -661,10 +724,8 @@ impl GeyserPlugin for Ultra {
                             }
                         }
                         Err(e) => {
-                            self.encode_error_total.fetch_add(1, Ordering::Relaxed);
-                            counter!("ultra_encode_error_total", "kind" => "eos").increment(1);
-                            let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                            if (v & 0xFF) == 0 {
+                            self.meter.inc_encode_error_eos(1);
+                            if maybe_t0.is_some() {
                                 debug!(target = "ultra.encode", "eos encode failed: {e}");
                             }
                         }

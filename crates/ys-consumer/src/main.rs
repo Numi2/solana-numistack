@@ -2,7 +2,7 @@
 // crates/ys-consumer/src/main.rs
 #![forbid(unsafe_code)]
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
 use event_listener::{Event, Listener};
 use faststreams::{
@@ -38,17 +38,28 @@ fn uds_connect(path: &str) -> std::io::Result<UnixStream> {
 trait BatchSource {
     fn blocking_pop(&self, flush_interval: Duration) -> Option<Vec<u8>>;
     fn try_pop(&self) -> Option<Vec<u8>>;
+    fn approx_len(&self) -> usize;
 }
 
 impl BatchSource for Receiver<Vec<u8>> {
     #[inline]
-    fn blocking_pop(&self, _flush_interval: Duration) -> Option<Vec<u8>> {
-        // Use fully blocking recv for first item to avoid artificial latency.
-        self.recv().ok()
+    fn blocking_pop(&self, flush_interval: Duration) -> Option<Vec<u8>> {
+        // Block with timeout to support adaptive flush cadence; keep waiting on timeouts.
+        loop {
+            match self.recv_timeout(flush_interval) {
+                Ok(v) => return Some(v),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
     }
     #[inline]
     fn try_pop(&self) -> Option<Vec<u8>> {
         self.try_recv().ok()
+    }
+    #[inline]
+    fn approx_len(&self) -> usize {
+        self.len()
     }
 }
 
@@ -212,6 +223,7 @@ fn forward_frame(
 static FRAMES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 static FRAMES_DROPPED_OVERSIZE: AtomicU64 = AtomicU64::new(0);
 static FRAMES_DLQ: AtomicU64 = AtomicU64::new(0);
+static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct DlqSink {
@@ -339,6 +351,15 @@ fn drop_to_dlq(
     FRAMES_DROPPED_OVERSIZE.fetch_add(1, Ordering::Relaxed);
     let frame_len = frame.len();
     let kind = frame_kind_from_bytes(&frame, scratch);
+    // Oversize histograms to help determine sensible caps and batch windowing
+    histogram!("ys_consumer_oversize_frame_len", "kind" => kind).record(frame_len as f64);
+    if frame_len > frame_limit {
+        histogram!(
+            "ys_consumer_oversize_frame_excess_bytes",
+            "kind" => kind
+        )
+        .record((frame_len - frame_limit) as f64);
+    }
     warn!(
         target = "ys.consumer",
         reason = reason,
@@ -450,6 +471,10 @@ impl BatchSource for SpscQueue {
     fn try_pop(&self) -> Option<Vec<u8>> {
         self.q.pop()
     }
+    #[inline]
+    fn approx_len(&self) -> usize {
+        self.q.len()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -457,6 +482,45 @@ struct WriterLimits {
     batch_max: usize,
     batch_bytes_max: usize,
     frame_bytes_max: usize,
+}
+
+#[inline]
+fn scale_duration(base: Duration, denom: u32) -> Duration {
+    if denom <= 1 {
+        return base;
+    }
+    let micros: u128 = base.as_micros();
+    let scaled = (micros / denom as u128).max(1);
+    Duration::from_micros(scaled as u64)
+}
+
+#[inline]
+fn effective_flush_interval(base: Duration, prev_len: usize, curr_len: usize) -> Duration {
+    let mut denom: u32 = 1;
+    if curr_len > prev_len {
+        let growth = curr_len - prev_len;
+        if growth >= 32_768 {
+            denom = denom.max(8);
+        } else if growth >= 16_384 {
+            denom = denom.max(4);
+        } else if growth >= 4_096 {
+            denom = denom.max(2);
+        }
+    }
+    if curr_len >= 32_768 {
+        denom = denom.max(8);
+    } else if curr_len >= 16_384 {
+        denom = denom.max(4);
+    } else if curr_len >= 8_192 {
+        denom = denom.max(2);
+    }
+    // Keep at least 1ms to avoid busy loops while still bounding tail
+    let eff = scale_duration(base, denom);
+    if eff < Duration::from_millis(1) {
+        Duration::from_millis(1)
+    } else {
+        eff
+    }
 }
 
 fn writer_loop_generic<S: BatchSource>(
@@ -476,6 +540,7 @@ fn writer_loop_generic<S: BatchSource>(
     let mut backoff = Duration::from_millis(50);
     let mut pending_frame: Option<Vec<u8>> = None;
     let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut prev_queue_len: usize = 0;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -488,9 +553,15 @@ fn writer_loop_generic<S: BatchSource>(
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
+                    // Adapt flush interval when queue depth is rising to bound tail
+                    let curr_len = src.approx_len();
+                    let eff_flush =
+                        effective_flush_interval(flush_interval, prev_queue_len, curr_len);
+                    prev_queue_len = curr_len;
+
                     let (first, retried_singleton) = match pending_frame.take() {
                         Some(frame) => (frame, true),
-                        None => match src.blocking_pop(flush_interval) {
+                        None => match src.blocking_pop(eff_flush) {
                             Some(frame) => (frame, false),
                             None => break,
                         },
@@ -511,7 +582,7 @@ fn writer_loop_generic<S: BatchSource>(
                     let salvaged_singleton = retried_singleton;
                     let start = Instant::now();
                     while batch.len() < batch_max {
-                        if start.elapsed() >= flush_interval {
+                        if start.elapsed() >= eff_flush {
                             break;
                         }
                         match src.try_pop() {
@@ -883,9 +954,12 @@ async fn main() -> Result<()> {
                     vote: false, // is_vote not available in new structure
                 });
                 let mut buf = buf_pool.get();
-                let t0 = Instant::now();
+                let v = SAMPLE_SEQ.fetch_add(1, Ordering::Relaxed);
+                let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
                 if encode_into_with(&rec, &mut buf, EncodeOptions::latency_uds()).is_ok() {
-                    histogram!("ys_consumer_encode_us", "kind" => "tx").record(t0.elapsed().as_secs_f64() * 1e6);
+                    if let Some(t0) = maybe_t0 {
+                        histogram!("ys_consumer_encode_us", "kind" => "tx").record(t0.elapsed().as_secs_f64() * 1e6);
+                    }
                     if !forward_frame(buf, &txq_opt, &spsc_send_opt, &shutdown, &buf_pool) {
                         counter!("ys_consumer_dropped_total").increment(1);
                     }
@@ -908,9 +982,12 @@ async fn main() -> Result<()> {
                         data: &acc.data,
                     });
                     let mut buf = buf_pool.get();
-                    let t0 = Instant::now();
+                    let v = SAMPLE_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
                     if encode_record_ref_into_with(&aref, &mut buf, EncodeOptions::latency_uds()).is_ok() {
-                        histogram!("ys_consumer_encode_us", "kind" => "account").record(t0.elapsed().as_secs_f64() * 1e6);
+                        if let Some(t0) = maybe_t0 {
+                            histogram!("ys_consumer_encode_us", "kind" => "account").record(t0.elapsed().as_secs_f64() * 1e6);
+                        }
                         if !forward_frame(buf, &txq_opt, &spsc_send_opt, &shutdown, &buf_pool) {
                             counter!("ys_consumer_dropped_total").increment(1);
                         }
@@ -935,9 +1012,10 @@ async fn main() -> Result<()> {
                     leader: ld,
                 });
                 let mut buf = buf_pool.get();
-                let t0 = Instant::now();
+                let v = SAMPLE_SEQ.fetch_add(1, Ordering::Relaxed);
+                let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
                 if encode_into_with(&rec, &mut buf, EncodeOptions::latency_uds()).is_ok() {
-                    histogram!("ys_consumer_encode_us", "kind" => "block").record(t0.elapsed().as_secs_f64() * 1e6);
+                    if let Some(t0) = maybe_t0 { histogram!("ys_consumer_encode_us", "kind" => "block").record(t0.elapsed().as_secs_f64() * 1e6); }
                     if !forward_frame(buf, &txq_opt, &spsc_send_opt, &shutdown, &buf_pool) {
                         counter!("ys_consumer_dropped_total").increment(1);
                     }
@@ -948,9 +1026,10 @@ async fn main() -> Result<()> {
             Some(subscribe_update::UpdateOneof::Slot(s)) => {
                 let rec = Record::Slot { slot: s.slot, parent: s.parent, status: s.status as u8 };
                 let mut buf = buf_pool.get();
-                let t0 = Instant::now();
+                let v = SAMPLE_SEQ.fetch_add(1, Ordering::Relaxed);
+                let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
                 if encode_into_with(&rec, &mut buf, EncodeOptions::latency_uds()).is_ok() {
-                    histogram!("ys_consumer_encode_us", "kind" => "slot").record(t0.elapsed().as_secs_f64() * 1e6);
+                    if let Some(t0) = maybe_t0 { histogram!("ys_consumer_encode_us", "kind" => "slot").record(t0.elapsed().as_secs_f64() * 1e6); }
                     if !forward_frame(buf, &txq_opt, &spsc_send_opt, &shutdown, &buf_pool) {
                         counter!("ys_consumer_dropped_total").increment(1);
                     }

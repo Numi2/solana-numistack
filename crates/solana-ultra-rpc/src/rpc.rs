@@ -93,7 +93,9 @@ impl RpcRouter {
             if enc != "base64" {
                 self.metrics
                     .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
-                return Err(RpcCallError::invalid_params("unsupported encoding; only base64 is supported"));
+                return Err(RpcCallError::invalid_params(
+                    "unsupported encoding; only base64 is supported",
+                ));
             }
         }
         if let Some(commitment) = &cfg.commitment {
@@ -111,14 +113,23 @@ impl RpcRouter {
             if observed < required_slot {
                 self.metrics
                     .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
-                return Err(RpcCallError::min_context_slot_not_reached(required_slot, observed));
+                return Err(RpcCallError::min_context_slot_not_reached(
+                    required_slot,
+                    observed,
+                ));
             }
         }
 
-        // Build response (apply optional dataSlice)
-        let value = self.cache.get(&pubkey).map(|record| {
-            account_to_response_with_slice(record.as_ref(), cfg.data_slice.as_ref())
-        });
+        // Build response with a fast path for the common case (no dataSlice)
+        let value = if let Some(slice) = cfg.data_slice.as_ref() {
+            self.cache
+                .get(&pubkey)
+                .map(|record| account_to_response_with_slice(record.as_ref(), Some(slice)))
+        } else {
+            self.cache
+                .get(&pubkey)
+                .map(|record| account_to_response(record.as_ref()))
+        };
 
         let bytes = value.as_ref().map(data_size).unwrap_or(0);
         self.metrics
@@ -132,8 +143,11 @@ impl RpcRouter {
         let (pubkeys, cfg) = match parse_multiple_account_params(params) {
             Ok(v) => v,
             Err(err) => {
-                self.metrics
-                    .record_request("getMultipleAccounts", start.elapsed().as_secs_f64(), 0);
+                self.metrics.record_request(
+                    "getMultipleAccounts",
+                    start.elapsed().as_secs_f64(),
+                    0,
+                );
                 return Err(err);
             }
         };
@@ -172,20 +186,35 @@ impl RpcRouter {
                     start.elapsed().as_secs_f64(),
                     0,
                 );
-                return Err(RpcCallError::min_context_slot_not_reached(required_slot, observed));
+                return Err(RpcCallError::min_context_slot_not_reached(
+                    required_slot,
+                    observed,
+                ));
             }
         }
 
-        // Conservative per-key lookups to avoid coupling to shard math in this layer
+        // Conservative per-key lookups to avoid coupling to shard math in this layer,
+        // with a fast path when no dataSlice is requested.
         let mut total_bytes = 0usize;
         let mut results = Vec::with_capacity(pubkeys.len());
-        for key in pubkeys {
-            let entry = self
-                .cache
-                .get(&key)
-                .map(|record| account_to_response_with_slice(record.as_ref(), cfg.data_slice.as_ref()));
-            total_bytes += entry.as_ref().map(data_size).unwrap_or(0);
-            results.push(entry);
+        if let Some(slice) = cfg.data_slice.as_ref() {
+            for key in pubkeys {
+                let entry = self
+                    .cache
+                    .get(&key)
+                    .map(|record| account_to_response_with_slice(record.as_ref(), Some(slice)));
+                total_bytes += entry.as_ref().map(data_size).unwrap_or(0);
+                results.push(entry);
+            }
+        } else {
+            for key in pubkeys {
+                let entry = self
+                    .cache
+                    .get(&key)
+                    .map(|record| account_to_response(record.as_ref()));
+                total_bytes += entry.as_ref().map(data_size).unwrap_or(0);
+                results.push(entry);
+            }
         }
         self.metrics.record_request(
             "getMultipleAccounts",
@@ -351,10 +380,7 @@ impl AccountInfoValue {
 
     #[inline]
     /// Construct a payload from a cached account record with custom encoded data.
-    pub(crate) fn from_record_with_data(
-        record: &AccountRecord,
-        encoded_data: Arc<str>,
-    ) -> Self {
+    pub(crate) fn from_record_with_data(record: &AccountRecord, encoded_data: Arc<str>) -> Self {
         Self {
             lamports: record.lamports(),
             owner: OwnerString::from(record.owner_arc()),
@@ -437,6 +463,12 @@ impl EncodedAccountData {
     /// Length of the encoded payload in bytes.
     pub fn len(&self) -> usize {
         self.payload.len()
+    }
+
+    #[inline]
+    /// Returns true when the encoded payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
     }
 
     #[inline]

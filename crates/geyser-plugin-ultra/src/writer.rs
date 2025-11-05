@@ -1,22 +1,20 @@
 // Numan Thabit 2025
 // crates/geyser-plugin-ultra/src/writer.rs
 use crate::config::ValidatedConfig;
+use crate::meter::Meter;
 use crate::pool::PooledBuf;
 use crate::queue::Consumer;
 use faststreams::write_all_vectored_slices;
 #[cfg(target_os = "linux")]
 use libc;
 use metrics::{counter, gauge, histogram};
-#[cfg(target_os = "linux")]
-use nix::sched::{sched_setaffinity, CpuSet};
-#[cfg(target_os = "linux")]
-use nix::unistd::Pid;
 use smallvec::SmallVec;
 use socket2::SockRef;
 use std::cell::Cell;
+use std::io::IoSlice;
 use std::os::unix::net::UnixStream;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread;
@@ -36,32 +34,23 @@ pub fn run_writer(
     cfg: ValidatedConfig,
     queue: Consumer<PooledBuf>,
     shutdown: &Arc<AtomicBool>,
-    queue_depth_max: Arc<AtomicU64>,
-    processed_total: Arc<AtomicU64>,
+    meter: Arc<Meter>,
+    core_affinity: Option<core_affinity::CoreId>,
 ) {
     // NOTE: For lowest tail latency in production, consider isolating the pinned core from the
     // general scheduler using kernel boot parameters, e.g. isolcpus=nohz,managed_irq,domain,1
     // and moving other background daemons off that core. This complements RT scheduling below.
-    #[cfg(target_os = "linux")]
     {
-        if let Some(core) = cfg.pin_core {
-            match CpuSet::new().and_then(|mut set| set.set(core).map(|_| set)) {
-                Ok(cpuset) => {
-                    if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpuset) {
-                        error!(
-                            target = "ultra.writer",
-                            "failed to set CPU affinity to core {core}: {e}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        target = "ultra.writer",
-                        "failed to build CPU set for core {core}: {e}"
-                    );
-                }
+        if let Some(core_id) = core_affinity {
+            let _ = core_affinity::set_for_current(core_id);
+        }
+        #[cfg(target_os = "linux")]
+        if core_affinity.is_none() {
+            if let Some(pc) = cfg.pin_core {
+                let _ = core_affinity::set_for_current(core_affinity::CoreId { id: pc });
             }
         }
+        #[cfg(target_os = "linux")]
         if let Some(prio) = cfg.rt_priority {
             let policy_str = cfg.sched_policy.as_deref().unwrap_or("fifo");
             let policy = if policy_str.eq_ignore_ascii_case("rr") {
@@ -93,6 +82,9 @@ pub fn run_writer(
         static HISTO_SEQ: Cell<u64> = const { Cell::new(0) };
     }
     const SPIN_SLEEP: Duration = Duration::from_micros(50);
+    const BUSY_SPINS: usize = 256;
+    const WRITE_SPIN_CAP: Duration = Duration::from_micros(300);
+    const WRITE_SLEEP_BACKOFF: Duration = Duration::from_micros(750);
 
     fn pop_with_timeout(
         queue: &Consumer<PooledBuf>,
@@ -100,6 +92,7 @@ pub fn run_writer(
         shutdown: &AtomicBool,
     ) -> PopOutcome<PooledBuf> {
         let start = Instant::now();
+        let mut spins = 0usize;
         loop {
             if let Some(item) = queue.pop() {
                 return PopOutcome::Item(item);
@@ -109,6 +102,11 @@ pub fn run_writer(
             }
             if timeout != Duration::ZERO && start.elapsed() >= timeout {
                 return PopOutcome::Timeout;
+            }
+            if spins < BUSY_SPINS {
+                spins = spins.wrapping_add(1);
+                std::hint::spin_loop();
+                continue;
             }
             thread::sleep(SPIN_SLEEP);
         }
@@ -208,72 +206,84 @@ pub fn run_writer(
                                 }
                             }
                             let mut send_batch = std::mem::take(&mut batch);
-                            let elapsed;
-                            {
-                                let write_start = Instant::now();
-                                let mut slices_buf: SmallVec<[&[u8]; 64]> =
-                                    SmallVec::with_capacity(send_batch.len().min(64));
-                                for buf in &send_batch {
-                                    if let Some(slice) = buf.as_slice() {
-                                        slices_buf.push(slice);
-                                    }
+                            let write_start = Instant::now();
+                            let mut ios: SmallVec<[IoSlice<'_>; 64]> =
+                                SmallVec::with_capacity(send_batch.len().min(64));
+                            for buf in &send_batch {
+                                if let Some(slice) = buf.as_slice() {
+                                    ios.push(IoSlice::new(slice));
                                 }
-                                {
-                                    // Transient backpressure handling
-                                    loop {
-                                        match write_all_vectored_slices(&mut stream, &slices_buf) {
-                                            Ok(()) => break,
-                                            Err(ref e)
-                                                if e.kind() == std::io::ErrorKind::WouldBlock
-                                                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                                            {
-                                                counter!("ultra_write_timeouts_total").increment(1);
-                                                if shutdown
-                                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                                {
-                                                    break;
-                                                }
-                                                thread::sleep(Duration::from_millis(1));
-                                                continue;
-                                            }
-                                            Err(e) => {
-                                                error!(target = "ultra.writer", "write error: {e}");
-                                                break;
-                                            }
+                            }
+                            let mut stall_ns: u128 = 0;
+                            let mut block_start: Option<Instant> = None;
+                            let mut spun = false;
+                            let mut write_ok = false;
+                            loop {
+                                match write_all_vectored_slices(&mut stream, ios.as_mut_slice()) {
+                                    Ok(()) => {
+                                        if let Some(start) = block_start.take() {
+                                            stall_ns += start.elapsed().as_nanos();
                                         }
+                                        write_ok = true;
+                                        break;
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        counter!("ultra_write_timeouts_total").increment(1);
+                                        if block_start.is_none() {
+                                            block_start = Some(Instant::now());
+                                        }
+                                        if !spun {
+                                            counter!("ultra_write_backoff_total", "phase" => "spin")
+                                                .increment(1);
+                                            let spin_until = Instant::now() + WRITE_SPIN_CAP;
+                                            while Instant::now() < spin_until {
+                                                std::hint::spin_loop();
+                                            }
+                                            spun = true;
+                                        } else {
+                                            counter!("ultra_write_backoff_total", "phase" => "sleep")
+                                                .increment(1);
+                                            thread::sleep(WRITE_SLEEP_BACKOFF);
+                                        }
+                                        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        if let Some(start) = block_start.take() {
+                                            stall_ns += start.elapsed().as_nanos();
+                                        }
+                                        error!(target = "ultra.writer", "write error: {e}");
+                                        break;
                                     }
                                 }
-                                slices_buf.clear();
-                                elapsed = write_start.elapsed().as_nanos() as f64 / 1_000_000.0;
                             }
-                            counter!("ultra_bytes_sent_total").increment(size as u64);
-                            counter!("ultra_batches_sent_total").increment(1);
-                            histogram!("ultra_batch_len").record(send_batch.len() as f64);
-                            histogram!("ultra_batch_bytes").record(size as f64);
-                            HISTO_SEQ.with(|seq| {
-                                let v = seq.get();
-                                seq.set(v.wrapping_add(1));
-                                if (v & histo_mask) == 0 {
-                                    histogram!("ultra_batch_ms").record(elapsed);
-                                }
-                            });
-                            let ql = queue.len() as u64;
-                            gauge!("ultra_queue_len").set(ql as f64);
-                            // track max
-                            let mut cur = queue_depth_max.load(Ordering::Relaxed);
-                            while ql > cur {
-                                match queue_depth_max.compare_exchange(
-                                    cur,
-                                    ql,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => cur = actual,
-                                }
+                            let elapsed = write_start.elapsed();
+                            if stall_ns > 0 && write_ok {
+                                histogram!("ultra_write_block_us")
+                                    .record(stall_ns as f64 / 1_000.0);
                             }
-                            let sent_count = send_batch.len() as u64;
-                            processed_total.fetch_add(sent_count, Ordering::Relaxed);
+                            let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+                            if write_ok {
+                                counter!("ultra_bytes_sent_total").increment(size as u64);
+                                counter!("ultra_batches_sent_total").increment(1);
+                                histogram!("ultra_batch_len").record(send_batch.len() as f64);
+                                histogram!("ultra_batch_bytes").record(size as f64);
+                                HISTO_SEQ.with(|seq| {
+                                    let v = seq.get();
+                                    seq.set(v.wrapping_add(1));
+                                    if (v & histo_mask) == 0 {
+                                        histogram!("ultra_batch_ms").record(elapsed_ms);
+                                    }
+                                });
+                                let sent_count = send_batch.len() as u64;
+                                meter.inc_processed(sent_count);
+                            }
+                            drop(ios);
                             // Return frames to pool by dropping items in place
                             send_batch.clear();
                             batch = send_batch;
@@ -292,7 +302,7 @@ pub fn run_writer(
                 backoff = backoff
                     .max(Duration::from_millis(200))
                     .min(Duration::from_secs(2));
-                counter!("ultra_reconnects_total").increment(1);
+                meter.inc_reconnects(1);
                 backoff_seq = backoff_seq.wrapping_add(1);
                 let jitter = Duration::from_millis(backoff_seq & 0x1F).min(backoff / 2);
                 let sleep_for = backoff + jitter;

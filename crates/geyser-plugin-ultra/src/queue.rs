@@ -1,12 +1,11 @@
 // Numan Thabit 1337
+use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Lock-free single-producer single-consumer ring buffer.
-//
-
 pub struct SpscRing<T> {
     inner: Arc<Inner<T>>,
 }
@@ -22,8 +21,9 @@ pub struct Consumer<T> {
 struct Inner<T> {
     buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
     capacity: usize,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    mask_val: usize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
 }
 
 unsafe impl<T: Send> Send for Producer<T> {}
@@ -33,19 +33,29 @@ unsafe impl<T: Send> Sync for Producer<T> {}
 unsafe impl<T: Send> Sync for Consumer<T> {}
 unsafe impl<T: Send> Sync for SpscRing<T> {}
 
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<T> SpscRing<T> {
     /// Create a ring buffer with the requested capacity. Capacity must be > 0.
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity must be positive");
-        let mut buffer = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
+        let cap_pow2 = capacity.next_power_of_two();
+        let mut buffer = Vec::with_capacity(cap_pow2);
+        for _ in 0..cap_pow2 {
             buffer.push(UnsafeCell::new(MaybeUninit::uninit()));
         }
         let inner = Arc::new(Inner {
             buffer: buffer.into_boxed_slice(),
-            capacity,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            capacity: cap_pow2,
+            mask_val: cap_pow2 - 1,
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
         });
         Self { inner }
     }
@@ -63,7 +73,7 @@ impl<T> SpscRing<T> {
 impl<T> Inner<T> {
     #[inline]
     fn mask(&self, idx: usize) -> usize {
-        idx % self.capacity
+        idx & self.mask_val
     }
 
     #[inline]
@@ -142,17 +152,17 @@ impl<T> Producer<T> {
         }
     }
 
-    /// Current number of items buffered.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
     /// Capacity of the ring.
     #[inline]
     #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         self.inner.capacity
+    }
+
+    /// Current number of items buffered.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 
@@ -181,12 +191,6 @@ impl<T> Consumer<T> {
                 Err(_) => continue,
             }
         }
-    }
-
-    /// Current number of items buffered.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
     }
 
     /// Capacity of the ring.

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::io::IoSlice;
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const COMPRESS_THRESHOLD: usize = 2048;
 const IOV_MAX_DEFAULT: usize = 1024; // typical on Linux/macOS
@@ -14,6 +15,24 @@ const FLAG_LZ4: u16 = 0x0001;
 
 pub const FRAME_MAGIC: u32 = 0x4653_5452; // 'FSTR'
 pub const FRAME_VERSION: u16 = 1;
+
+const FRAME_HEADER_TEMPLATE: [u8; 12] = [
+    (FRAME_MAGIC >> 24) as u8,
+    (FRAME_MAGIC >> 16) as u8,
+    (FRAME_MAGIC >> 8) as u8,
+    (FRAME_MAGIC) as u8,
+    (FRAME_VERSION >> 8) as u8,
+    (FRAME_VERSION) as u8,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+// Exponentially weighted moving average for recent payload lengths
+static AVG_LEN: AtomicUsize = AtomicUsize::new(512);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUpdate {
@@ -97,6 +116,7 @@ pub enum StreamError {
 pub struct EncodeOptions {
     pub enable_compression: bool,
     pub compress_threshold: usize,
+    pub payload_hint: Option<usize>,
 }
 
 impl EncodeOptions {
@@ -104,6 +124,7 @@ impl EncodeOptions {
         Self {
             enable_compression: true,
             compress_threshold: COMPRESS_THRESHOLD,
+            payload_hint: Some(AVG_LEN.load(Ordering::Relaxed)),
         }
     }
     pub fn latency_uds() -> Self {
@@ -111,6 +132,7 @@ impl EncodeOptions {
         Self {
             enable_compression: false,
             compress_threshold: usize::MAX,
+            payload_hint: Some(AVG_LEN.load(Ordering::Relaxed)),
         }
     }
     /// Throughput-oriented remote hop: enable LZ4 with a low threshold to
@@ -119,6 +141,7 @@ impl EncodeOptions {
         Self {
             enable_compression: true,
             compress_threshold: 512,
+            payload_hint: Some(AVG_LEN.load(Ordering::Relaxed)),
         }
     }
 }
@@ -140,22 +163,26 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
 
         // header: magic(4) | version(2) | flags(2) | len(4)
         let mut buf: Vec<u8> = Vec::with_capacity(12 + body.len());
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&flags.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+        buf[6..8].copy_from_slice(&flags.to_be_bytes());
+        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
         buf.extend_from_slice(&body);
         Ok(buf)
     } else {
-        // Low-latency path: avoid an intermediate payload allocation by sizing once and
-        // serializing directly into the final buffer after writing the header.
-        let payload_len = bincode_opts.serialized_size(rec)? as usize;
-        let mut buf: Vec<u8> = Vec::with_capacity(12 + payload_len);
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        // Single-pass: reserve header, serialize payload once, then backfill header
+        let hint = opts
+            .payload_hint
+            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
         bincode_opts.serialize_into(&mut buf, rec)?;
+        let payload_len = (buf.len() - 12) as u32;
+        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+        // Update EMA: len := (7*prev + payload_len)/8, min 64
+        let len = payload_len as usize;
+        let prev = AVG_LEN.load(Ordering::Relaxed);
+        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+        AVG_LEN.store(next, Ordering::Relaxed);
         Ok(buf)
     }
 }
@@ -178,20 +205,26 @@ pub fn encode_record_ref_with(
         };
 
         let mut buf: Vec<u8> = Vec::with_capacity(12 + body.len());
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&flags.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+        buf[6..8].copy_from_slice(&flags.to_be_bytes());
+        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
         buf.extend_from_slice(&body);
         Ok(buf)
     } else {
-        let payload_len = bincode_opts.serialized_size(rec)? as usize;
-        let mut buf: Vec<u8> = Vec::with_capacity(12 + payload_len);
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        // Single-pass: reserve header, serialize payload once, then backfill header
+        let hint = opts
+            .payload_hint
+            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
         bincode_opts.serialize_into(&mut buf, rec)?;
+        let payload_len = (buf.len() - 12) as u32;
+        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+        // Update EMA
+        let len = payload_len as usize;
+        let prev = AVG_LEN.load(Ordering::Relaxed);
+        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+        AVG_LEN.store(next, Ordering::Relaxed);
         Ok(buf)
     }
 }
@@ -215,20 +248,26 @@ pub fn encode_record_ref_into_with(
             (0, payload)
         };
         buf.reserve(12 + body.len());
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&flags.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+        buf[6..8].copy_from_slice(&flags.to_be_bytes());
+        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
         buf.extend_from_slice(&body);
         Ok(())
     } else {
-        let payload_len = bincode_opts.serialized_size(rec)? as usize;
-        buf.reserve(12 + payload_len);
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        bincode_opts.serialize_into(buf, rec)?;
+        // Single-pass: reserve header, serialize payload once, then backfill header
+        let hint = opts
+            .payload_hint
+            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
+        buf.reserve(12 + hint);
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+        bincode_opts.serialize_into(&mut *buf, rec)?;
+        let payload_len = (buf.len() - 12) as u32;
+        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+        // Update EMA
+        let len = payload_len as usize;
+        let prev = AVG_LEN.load(Ordering::Relaxed);
+        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+        AVG_LEN.store(next, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -253,20 +292,26 @@ pub fn encode_into_with(
             (0, payload)
         };
         buf.reserve(12 + body.len());
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&flags.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+        buf[6..8].copy_from_slice(&flags.to_be_bytes());
+        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
         buf.extend_from_slice(&body);
         Ok(())
     } else {
-        let payload_len = bincode_opts.serialized_size(rec)? as usize;
-        buf.reserve(12 + payload_len);
-        buf.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&FRAME_VERSION.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        bincode_opts.serialize_into(buf, rec)?;
+        // Single-pass: reserve header, serialize payload once, then backfill header
+        let hint = opts
+            .payload_hint
+            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
+        buf.reserve(12 + hint);
+        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+        bincode_opts.serialize_into(&mut *buf, rec)?;
+        let payload_len = (buf.len() - 12) as u32;
+        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+        // Update EMA
+        let len = payload_len as usize;
+        let prev = AVG_LEN.load(Ordering::Relaxed);
+        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+        AVG_LEN.store(next, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -413,71 +458,21 @@ pub fn write_all_vectored(mut dst: impl Write, frames: &[Vec<u8>]) -> io::Result
 }
 
 /// Write a batch of byte slices using vectored IO and handle partial writes.
-pub fn write_all_vectored_slices(mut dst: impl Write, frames: &[&[u8]]) -> io::Result<()> {
-    let mut frame_idx: usize = 0;
-    let mut first_offset: usize = 0; // byte offset inside frames[frame_idx]
-    let iov_max = IOV_MAX_DEFAULT;
-
-    while frame_idx < frames.len() {
-        let remaining_frames = frames.len() - frame_idx;
-        let pre_cap = if remaining_frames < iov_max {
-            remaining_frames
-        } else {
-            iov_max
-        };
-        let mut iovecs: SmallVec<[IoSlice<'_>; INLINE_IOVEC_CAP]> =
-            SmallVec::with_capacity(pre_cap);
-        let mut added = 0usize;
-        let mut idx = frame_idx;
-        while idx < frames.len() && added < iov_max {
-            if idx == frame_idx && first_offset != 0 {
-                let s = &frames[idx][first_offset..];
-                if !s.is_empty() {
-                    iovecs.push(IoSlice::new(s));
-                }
-            } else {
-                let s = frames[idx];
-                if !s.is_empty() {
-                    iovecs.push(IoSlice::new(s));
-                }
-            }
-            added += 1;
-            idx += 1;
-        }
-
-        let n = dst.write_vectored(&iovecs)?;
+pub fn write_all_vectored_slices(
+    dst: &mut impl Write,
+    slices: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    let mut offset = 0usize;
+    while offset < slices.len() {
+        let n = dst.write_vectored(&slices[offset..])?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+            return Err(io::ErrorKind::WriteZero.into());
         }
-
-        let mut remaining = n;
-        if remaining == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
-        }
-        if first_offset != 0 {
-            let slice_len = frames[frame_idx].len() - first_offset;
-            if remaining >= slice_len {
-                remaining -= slice_len;
-                frame_idx += 1;
-                first_offset = 0;
-            } else {
-                first_offset += remaining;
-                continue;
-            }
-        }
-        while remaining > 0 {
-            if frame_idx >= frames.len() {
-                break;
-            }
-            let slice_len = frames[frame_idx].len();
-            if remaining >= slice_len {
-                remaining -= slice_len;
-                frame_idx += 1;
-            } else {
-                first_offset = remaining;
-                remaining = 0;
-            }
-        }
+        let mut rem: &mut [IoSlice<'_>] = &mut slices[offset..];
+        IoSlice::advance_slices(&mut rem, n);
+        let remaining = rem.len();
+        let consumed = (slices.len() - offset) - remaining;
+        offset += consumed;
     }
     Ok(())
 }

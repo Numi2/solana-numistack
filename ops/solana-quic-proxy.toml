@@ -1,0 +1,30 @@
+listen = "0.0.0.0:8898"
+upstream = "127.0.0.1:8899"
+server_name = "solana-ultra-rpc"
+
+# keep modest to bound copies
+max_request_bytes = 1048576
+max_response_bytes = 2097152
+
+# avoid extreme concurrency on single conn
+max_streams = 512
+
+# keep QUIC hot
+keep_alive_ms = 250
+max_idle_timeout_ms = 15000
+
+# safe path MTU; raise only if you measured
+initial_mtu = 1400
+
+# reduce buffering to cut bloat/latency
+stream_receive_window = 1048576
+connection_receive_window = 16777216
+send_window = 16777216
+
+datagram_send_buffer = 1048576
+datagram_recv_buffer = 1048576
+
+lazy_connect = false
+http_trace = false
+
+

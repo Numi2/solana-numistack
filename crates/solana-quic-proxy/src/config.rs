@@ -99,7 +99,6 @@ pub struct CliArgs {
     #[arg(long)]
     pub datagram_recv_buffer: Option<usize>,
 
-    /// Skip establishing the upstream QUIC connection during startup.
     #[arg(long, default_value_t = false)]
     pub lazy_connect: bool,
 

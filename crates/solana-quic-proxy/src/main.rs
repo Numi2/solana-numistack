@@ -10,7 +10,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use bytes::{BufMut, BytesMut};
 use clap::Parser;
+use serde::ser::SerializeStruct;
+use serde::Serialize;
 use solana_quic_proxy::{
     client::{ProxyError, QuicRpcClient},
     config::{CliArgs, Config},
@@ -19,6 +22,8 @@ use solana_quic_proxy::{
 use tokio::signal;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
+ 
+use serde_json::Serializer as JsonSerializer;
 
 #[derive(Clone)]
 struct AppState {
@@ -115,18 +120,12 @@ async fn proxy_handler(State(state): State<AppState>, body: Bytes) -> Response {
             state.metrics.record_failure();
             error!(error = %err, "upstream request failed");
             let status = status_for_error(&err);
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": err.to_string(),
-                },
-                "id": null,
-            });
+            let message = err.to_string();
+            let payload = json_rpc_error_bytes(-32000, &message);
             Response::builder()
                 .status(status)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
+                .body(Body::from(payload))
                 .unwrap_or_else(|builder_err| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, &builder_err.to_string())
                 })
@@ -173,4 +172,30 @@ fn status_for_error(err: &ProxyError) -> StatusCode {
         }
         ProxyError::Protocol(_) => StatusCode::BAD_GATEWAY,
     }
+}
+
+fn json_rpc_error_bytes(code: i64, message: &str) -> Bytes {
+    let mut buf = BytesMut::with_capacity(128 + message.len());
+    {
+        let mut writer = buf.writer();
+        let mut serializer = JsonSerializer::new(&mut writer);
+        let mut obj = serializer
+            .serialize_struct("JsonRpcResponse", 3)
+            .expect("serialize_struct to memory cannot fail");
+        obj.serialize_field("jsonrpc", "2.0")
+            .expect("writing jsonrpc field");
+        obj.serialize_field("error", &JsonRpcErrorPayload { code, message })
+            .expect("writing error field");
+        obj.serialize_field("id", &())
+            .expect("writing id field");
+        obj.end().expect("finalize struct");
+    }
+    buf.freeze()
+}
+
+#[derive(Serialize)]
+struct JsonRpcErrorPayload<'a> {
+    code: i64,
+    #[serde(borrow)]
+    message: &'a str,
 }

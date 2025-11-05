@@ -168,6 +168,8 @@ pub fn run_writer(
                 #[cfg(target_os = "linux")]
                 #[allow(unused_mut)]
                 let mut send_fd: Option<std::os::fd::RawFd> = None;
+                #[cfg(target_os = "linux")]
+                let mut seq_scratch = SendBatchScratch::with_capacity(cfg.batch_max);
                 match &mut stream {
                     EitherSocket::Stream(s) => {
                         s.set_nonblocking(false).ok();
@@ -180,6 +182,10 @@ pub fn run_writer(
                         }
                         if let Ok(effective) = sockref.send_buffer_size() {
                             info!(target = "ultra.writer", "send buffer size ~{} bytes", effective);
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            let _ = &seq_scratch;
                         }
                     }
                     #[cfg(target_os = "linux")]
@@ -319,38 +325,27 @@ pub fn run_writer(
                                         }
                                     }
                                     #[cfg(target_os = "linux")]
-                                    EitherSocket::Seqpacket(s) => {
+                                    EitherSocket::Seqpacket(_) => {
                                         // Use sendmmsg to send each frame as a discrete datagram
                                         let fd = send_fd.expect("fd");
-                                        // Prepare iovecs and message headers
-                                        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(send_batch.len());
-                                        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(send_batch.len());
-                                        for buf in &send_batch {
-                                            if let Some(slice) = buf.as_slice() {
-                                                iovecs.push(libc::iovec { iov_base: slice.as_ptr() as *mut _, iov_len: slice.len() });
-                                                let hdr = libc::msghdr {
-                                                    msg_name: std::ptr::null_mut(),
-                                                    msg_namelen: 0,
-                                                    msg_iov: std::ptr::null_mut(),
-                                                    msg_iovlen: 0,
-                                                    msg_control: std::ptr::null_mut(),
-                                                    msg_controllen: 0,
-                                                    msg_flags: 0,
-                                                };
-                                                let mm = libc::mmsghdr { msg_hdr: hdr, msg_len: 0 };
-                                                msgs.push(mm);
-                                            }
-                                        }
-                                        // Wire iovecs into msgs
-                                        for (i, msg) in msgs.iter_mut().enumerate() {
-                                            msg.msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
-                                            msg.msg_hdr.msg_iovlen = 1;
-                                        }
+                                        let scratch = &mut seq_scratch;
+                                        scratch.prepare(&send_batch);
                                         let mut sent_total = 0usize;
+                                        let total_msgs = scratch.len();
                                         loop {
-                                            let remaining = (msgs.len() - sent_total).min(1024) as u32;
-                                            if remaining == 0 { write_ok = true; break; }
-                                            let ret = unsafe { libc::sendmmsg(fd, msgs[sent_total..].as_mut_ptr(), remaining, 0) };
+                                            let remaining = (total_msgs.saturating_sub(sent_total)).min(1024);
+                                            if remaining == 0 {
+                                                write_ok = true;
+                                                break;
+                                            }
+                                            let ret = unsafe {
+                                                libc::sendmmsg(
+                                                    fd,
+                                                    scratch.msg_ptr(sent_total),
+                                                    remaining as u32,
+                                                    0,
+                                                )
+                                            };
                                             if ret < 0 {
                                                 let err = std::io::Error::last_os_error();
                                                 if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut {
@@ -381,7 +376,7 @@ pub fn run_writer(
                                                     continue;
                                                 }
                                                 sent_total += ret as usize;
-                                                if sent_total >= msgs.len() {
+                                                if sent_total >= total_msgs {
                                                     if let Some(start) = block_start.take() { stall_ns += start.elapsed().as_nanos(); }
                                                     write_ok = true;
                                                     break;
@@ -472,4 +467,52 @@ enum EitherSocket {
     Stream(UnixStream),
     #[cfg(target_os = "linux")]
     Seqpacket(socket2::Socket),
+}
+
+#[cfg(target_os = "linux")]
+struct SendBatchScratch {
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+}
+
+#[cfg(target_os = "linux")]
+impl SendBatchScratch {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            iovecs: Vec::with_capacity(cap),
+            msgs: Vec::with_capacity(cap),
+        }
+    }
+
+    fn prepare(&mut self, batch: &[PooledBuf]) {
+        self.iovecs.clear();
+        self.msgs.clear();
+        for buf in batch {
+            if let Some(slice) = buf.as_slice() {
+                self.iovecs.push(libc::iovec {
+                    iov_base: slice.as_ptr() as *mut _,
+                    iov_len: slice.len(),
+                });
+                self.msgs.push(libc::mmsghdr {
+                    msg_hdr: unsafe { std::mem::zeroed() },
+                    msg_len: 0,
+                });
+            }
+        }
+        let base_ptr = self.iovecs.as_mut_ptr();
+        for (index, msg) in self.msgs.iter_mut().enumerate() {
+            unsafe {
+                msg.msg_hdr.msg_iov = base_ptr.add(index);
+            }
+            msg.msg_hdr.msg_iovlen = 1;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.msgs.len()
+    }
+
+    unsafe fn msg_ptr(&mut self, offset: usize) -> *mut libc::mmsghdr {
+        self.msgs.as_mut_ptr().add(offset)
+    }
 }

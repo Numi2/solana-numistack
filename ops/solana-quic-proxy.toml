@@ -27,4 +27,10 @@ datagram_recv_buffer = 1048576
 lazy_connect = false
 http_trace = false
 
+# request hedging/timing
+request_timeout_ms = 1200
+hedged_attempts = 1
+hedge_jitter_ms = 25
+enable_early_data = true
+
 

@@ -193,6 +193,10 @@ impl<T> Consumer<T> {
         }
     }
 
+    /// Current number of items buffered.
+    #[inline]
+    pub fn len(&self) -> usize { self.inner.len() }
+
     /// Capacity of the ring.
     #[inline]
     #[allow(dead_code)]

@@ -83,8 +83,6 @@ pub fn run_writer(
     }
     const SPIN_SLEEP: Duration = Duration::from_micros(50);
     const BUSY_SPINS: usize = 256;
-    const WRITE_SPIN_CAP: Duration = Duration::from_micros(300);
-    const WRITE_SLEEP_BACKOFF: Duration = Duration::from_micros(750);
 
     fn pop_with_timeout(
         queue: &Consumer<PooledBuf>,
@@ -146,6 +144,7 @@ pub fn run_writer(
                 }
                 // Batch & drain loop
                 let mut batch: Vec<PooledBuf> = Vec::with_capacity(cfg.batch_max);
+                let mut cur_flush_after_ms = cfg.flush_after_ms;
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -205,60 +204,82 @@ pub fn run_writer(
                                     }
                                 }
                             }
-                            let mut send_batch = std::mem::take(&mut batch);
-                            let write_start = Instant::now();
-                            let mut ios: SmallVec<[IoSlice<'_>; 64]> =
-                                SmallVec::with_capacity(send_batch.len().min(64));
-                            for buf in &send_batch {
-                                if let Some(slice) = buf.as_slice() {
-                                    ios.push(IoSlice::new(slice));
+                            // Adaptive flush tuning: shrink delay under pressure, restore slowly
+                            {
+                                let depth = queue.len();
+                                let cap = cfg.queue_capacity;
+                                if depth * 100 / cap >= 75 {
+                                    if cur_flush_after_ms > 0 {
+                                        cur_flush_after_ms = (cur_flush_after_ms / 2).max(0);
+                                    }
+                                } else if cur_flush_after_ms < cfg.flush_after_ms {
+                                    // restore slowly
+                                    cur_flush_after_ms = (cur_flush_after_ms + 1).min(cfg.flush_after_ms);
                                 }
                             }
+
+                            let mut send_batch = std::mem::take(&mut batch);
+                            let write_start = Instant::now();
                             let mut stall_ns: u128 = 0;
-                            let mut block_start: Option<Instant> = None;
-                            let mut spun = false;
                             let mut write_ok = false;
-                            loop {
-                                match write_all_vectored_slices(&mut stream, ios.as_mut_slice()) {
-                                    Ok(()) => {
-                                        if let Some(start) = block_start.take() {
-                                            stall_ns += start.elapsed().as_nanos();
-                                        }
-                                        write_ok = true;
-                                        break;
+                            {
+                                let mut ios: SmallVec<[IoSlice<'_>; 64]> =
+                                    SmallVec::with_capacity(send_batch.len().min(64));
+                                for buf in &send_batch {
+                                    if let Some(slice) = buf.as_slice() {
+                                        ios.push(IoSlice::new(slice));
                                     }
-                                    Err(ref e)
-                                        if e.kind() == std::io::ErrorKind::WouldBlock
-                                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                                    {
-                                        counter!("ultra_write_timeouts_total").increment(1);
-                                        if block_start.is_none() {
-                                            block_start = Some(Instant::now());
-                                        }
-                                        if !spun {
-                                            counter!("ultra_write_backoff_total", "phase" => "spin")
-                                                .increment(1);
-                                            let spin_until = Instant::now() + WRITE_SPIN_CAP;
-                                            while Instant::now() < spin_until {
-                                                std::hint::spin_loop();
+                                }
+                                let mut block_start: Option<Instant> = None;
+                                let mut spun = false;
+                                loop {
+                                    match write_all_vectored_slices(&mut stream, ios.as_mut_slice()) {
+                                        Ok(()) => {
+                                            if let Some(start) = block_start.take() {
+                                                stall_ns += start.elapsed().as_nanos();
                                             }
-                                            spun = true;
-                                        } else {
-                                            counter!("ultra_write_backoff_total", "phase" => "sleep")
-                                                .increment(1);
-                                            thread::sleep(WRITE_SLEEP_BACKOFF);
-                                        }
-                                        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                                            write_ok = true;
                                             break;
                                         }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        if let Some(start) = block_start.take() {
-                                            stall_ns += start.elapsed().as_nanos();
+                                        Err(ref e)
+                                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                                        {
+                                            counter!("ultra_write_timeouts_total").increment(1);
+                                            if block_start.is_none() {
+                                                block_start = Some(Instant::now());
+                                            }
+                                            if !spun {
+                                                counter!("ultra_write_backoff_total", "phase" => "spin")
+                                                    .increment(1);
+                                                let spin_until = Instant::now()
+                                                    + Duration::from_micros(cfg.write_spin_cap_us);
+                                                while Instant::now() < spin_until {
+                                                    std::hint::spin_loop();
+                                                }
+                                                spun = true;
+                                            } else {
+                                                counter!("ultra_write_backoff_total", "phase" => "sleep")
+                                                    .increment(1);
+                                                thread::sleep(Duration::from_micros(
+                                                    cfg.write_sleep_backoff_us,
+                                                ));
+                                            }
+                                            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                                                break;
+                                            }
+                                            continue;
                                         }
-                                        error!(target = "ultra.writer", "write error: {e}");
-                                        break;
+                                        Err(e) => {
+                                            if let Some(start) = block_start.take() {
+                                                stall_ns += start.elapsed().as_nanos();
+                                            }
+                                            error!(target = "ultra.writer", "write error: {e}");
+                                            counter!("ultra_write_errors_total").increment(1);
+                                            // attribute drops by batch size
+                                            counter!("ultra_write_error_drops_total").increment(send_batch.len() as u64);
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -283,7 +304,6 @@ pub fn run_writer(
                                 let sent_count = send_batch.len() as u64;
                                 meter.inc_processed(sent_count);
                             }
-                            drop(ios);
                             // Return frames to pool by dropping items in place
                             send_batch.clear();
                             batch = send_batch;

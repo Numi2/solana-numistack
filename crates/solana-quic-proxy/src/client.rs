@@ -32,6 +32,10 @@ pub struct QuicRpcClient {
     connection: ArcSwapOption<Connection>,
     connect_lock: Mutex<()>,
     recv_buf: Mutex<BytesMut>,
+    request_timeout: Option<Duration>,
+    hedged_attempts: u32,
+    hedge_jitter: Duration,
+    enable_early_data: bool,
 }
 
 pub struct ClientResponse {
@@ -56,6 +60,10 @@ impl QuicRpcClient {
             connection: ArcSwapOption::from(None),
             connect_lock: Mutex::new(()),
             recv_buf: Mutex::new(BytesMut::with_capacity(initial_recv_capacity)),
+            request_timeout: config.request_timeout,
+            hedged_attempts: config.hedged_attempts,
+            hedge_jitter: config.hedge_jitter,
+            enable_early_data: config.enable_early_data,
         })
     }
 
@@ -66,7 +74,58 @@ impl QuicRpcClient {
 
     pub async fn request(&self, payload: &[u8]) -> Result<ClientResponse, ProxyError> {
         let connection = self.connection().await?;
-        match self.request_inner(&connection, payload).await {
+        let fut = self.request_inner(&connection, payload);
+        let attempt = async {
+            match self.request_with_timeout(fut).await {
+                Ok(resp) => Ok(resp),
+                Err(err) => Err(err),
+            }
+        };
+        let result = if self.hedged_attempts <= 1 {
+            attempt.await
+        } else {
+            // Two-attempt hedging: launch second after jitter; first Ok wins.
+            let first = attempt;
+            let connection2 = self.connection().await?;
+            let payload2 = Bytes::copy_from_slice(payload);
+            let jitter = self.hedge_jitter;
+            let second = async move {
+                tokio::time::sleep(jitter).await;
+                self.request_with_timeout(self.request_inner(&connection2, &payload2)).await
+            };
+            tokio::pin!(first);
+            tokio::pin!(second);
+            let mut first_done = false;
+            let mut second_done = false;
+            loop {
+                tokio::select! {
+                    res1 = &mut first, if !first_done => {
+                        match res1 {
+                            Ok(ok) => break Ok(ok),
+                            Err(e) => {
+                                first_done = true;
+                                if second_done {
+                                    break Err(e);
+                                }
+                            }
+                        }
+                    }
+                    res2 = &mut second, if !second_done => {
+                        match res2 {
+                            Ok(ok) => break Ok(ok),
+                            Err(e) => {
+                                second_done = true;
+                                if first_done {
+                                    break Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        match result {
             Ok(response) => Ok(response),
             Err(err @ ProxyError::Connection(_))
             | Err(err @ ProxyError::Read(_))
@@ -77,6 +136,20 @@ impl QuicRpcClient {
                 Err(err)
             }
             Err(err) => Err(err),
+        }
+    }
+
+    async fn request_with_timeout<F>(&self, fut: F) -> Result<ClientResponse, ProxyError>
+    where
+        F: std::future::Future<Output = Result<ClientResponse, ProxyError>>,
+    {
+        if let Some(deadline) = self.request_timeout {
+            match tokio::time::timeout(deadline, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(ProxyError::Protocol("request timed out".into())),
+            }
+        } else {
+            fut.await
         }
     }
 
@@ -95,11 +168,14 @@ impl QuicRpcClient {
             .endpoint
             .connect(self.server_addr, &self.server_name)
             .map_err(ProxyError::Connect)?;
-
-        // Try 0-RTT if we have a cached session; fall back to full handshake on failure.
-        let connection = match connecting.into_0rtt() {
-            Ok((conn, _zero_rtt)) => conn,
-            Err(connecting) => connecting.await.map_err(ProxyError::Connection)?,
+        // Try 0-RTT only if enabled; otherwise, perform full handshake.
+        let connection = if self.enable_early_data {
+            match connecting.into_0rtt() {
+                Ok((conn, _zero_rtt)) => conn,
+                Err(connecting) => connecting.await.map_err(ProxyError::Connection)?,
+            }
+        } else {
+            connecting.await.map_err(ProxyError::Connection)?
         };
         self.connection.store(Some(Arc::new(connection.clone())));
         Ok(connection)
@@ -228,9 +304,9 @@ fn build_client_config(config: &Config) -> Result<ClientConfig> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"jsonrpc-quic".to_vec()];
-    // Enable 0-RTT: cache session tickets and allow early data (safe only for idempotent RPCs)
+    // Enable session tickets; gate early data by config for idempotent RPCs only
     crypto.resumption = Resumption::store(Arc::new(ClientSessionMemoryCache::new(256)));
-    crypto.enable_early_data = true;
+    crypto.enable_early_data = config.enable_early_data;
 
     let crypto = QuicClientConfig::try_from(crypto)
         .context("failed to convert TLS client config for QUIC")?;

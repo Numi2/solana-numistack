@@ -58,6 +58,10 @@ pub struct Config {
     pub writer_threads: usize,
     #[serde(default = "default_shed_throttle_ms")]
     pub shed_throttle_ms: u64,
+    #[serde(default = "default_write_spin_cap_us")]
+    pub write_spin_cap_us: u64,
+    #[serde(default = "default_write_sleep_backoff_us")]
+    pub write_sleep_backoff_us: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -114,6 +118,9 @@ fn default_shed_throttle_ms() -> u64 {
     500
 }
 
+fn default_write_spin_cap_us() -> u64 { 300 }
+fn default_write_sleep_backoff_us() -> u64 { 750 }
+
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
     pub socket_path: PathBuf,
@@ -136,6 +143,8 @@ pub struct ValidatedConfig {
     pub pool_default_cap: usize,
     pub writer_threads: usize,
     pub shed_throttle_ms: u64,
+    pub write_spin_cap_us: u64,
+    pub write_sleep_backoff_us: u64,
 }
 
 impl Config {
@@ -253,6 +262,8 @@ impl Config {
             writer_threads: self.writer_threads,
             queue_drop_policy: self.queue_drop_policy,
             shed_throttle_ms: self.shed_throttle_ms,
+            write_spin_cap_us: self.write_spin_cap_us,
+            write_sleep_backoff_us: self.write_sleep_backoff_us,
         })
     }
 }

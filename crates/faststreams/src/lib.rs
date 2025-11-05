@@ -171,62 +171,9 @@ impl EncodeOptions {
 }
 
 pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
-    let bincode_opts = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes();
-    if opts.enable_compression {
-        // Compress only when enabled and above threshold. This path incurs a payload allocation,
-        // which is acceptable for throughput-oriented configurations.
-        let payload = bincode_opts.serialize(rec)?;
-        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
-            let compressed = lz4_flex::block::compress_prepend_size(&payload);
-            (FLAG_LZ4, compressed)
-        } else {
-            (0, payload)
-        };
-
-        // header: magic(4) | version(2) | flags(2) | len(4)
-        let mut buf: Vec<u8> = Vec::with_capacity(12 + body.len());
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        buf[6..8].copy_from_slice(&flags.to_be_bytes());
-        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&body);
-        Ok(buf)
-    } else {
-        // Single-pass: reserve header, serialize payload once, then backfill header
-        let hint = opts
-            .payload_hint
-            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        match opts.format {
-            PayloadFormat::Bincode => {
-                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
-                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-                bincode_opts.serialize_into(&mut buf, rec)?;
-                let payload_len = (buf.len() - 12) as u32;
-                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-                // Update EMA: len := (7*prev + payload_len)/8, min 64
-                let len = payload_len as usize;
-                let prev = AVG_LEN.load(Ordering::Relaxed);
-                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-                AVG_LEN.store(next, Ordering::Relaxed);
-                Ok(buf)
-            }
-            #[cfg(feature = "rkyv")]
-            PayloadFormat::Rkyv => {
-                // Borrowed references still serialize via bincode to avoid cloning data.
-                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
-                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-                bincode_opts.serialize_into(&mut buf, rec)?;
-                let payload_len = (buf.len() - 12) as u32;
-                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-                let len = payload_len as usize;
-                let prev = AVG_LEN.load(Ordering::Relaxed);
-                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-                AVG_LEN.store(next, Ordering::Relaxed);
-                Ok(buf)
-            }
-        }
-    }
+    let mut buf = Vec::new();
+    encode_value_into(rec, &mut buf, opts)?;
+    Ok(buf)
 }
 
 /// Encode a borrowed record (e.g. `RecordRef::Account`) avoiding intermediate copies.
@@ -234,59 +181,9 @@ pub fn encode_record_ref_with(
     rec: &RecordRef<'_>,
     opts: EncodeOptions,
 ) -> Result<Vec<u8>, StreamError> {
-    let bincode_opts = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes();
-    if opts.enable_compression {
-        let payload = bincode_opts.serialize(rec)?;
-        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
-            let compressed = lz4_flex::block::compress_prepend_size(&payload);
-            (FLAG_LZ4, compressed)
-        } else {
-            (0, payload)
-        };
-
-        let mut buf: Vec<u8> = Vec::with_capacity(12 + body.len());
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        buf[6..8].copy_from_slice(&flags.to_be_bytes());
-        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&body);
-        Ok(buf)
-    } else {
-        // Single-pass: reserve header, serialize payload once, then backfill header
-        let hint = opts
-            .payload_hint
-            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        match opts.format {
-            PayloadFormat::Bincode => {
-                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
-                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-                bincode_opts.serialize_into(&mut buf, rec)?;
-                let payload_len = (buf.len() - 12) as u32;
-                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-                // Update EMA: len := (7*prev + payload_len)/8, min 64
-                let len = payload_len as usize;
-                let prev = AVG_LEN.load(Ordering::Relaxed);
-                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-                AVG_LEN.store(next, Ordering::Relaxed);
-                Ok(buf)
-            }
-            #[cfg(feature = "rkyv")]
-            PayloadFormat::Rkyv => {
-                // Borrowed references still serialize via bincode to avoid cloning data.
-                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
-                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-                bincode_opts.serialize_into(&mut buf, rec)?;
-                let payload_len = (buf.len() - 12) as u32;
-                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-                let len = payload_len as usize;
-                let prev = AVG_LEN.load(Ordering::Relaxed);
-                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-                AVG_LEN.store(next, Ordering::Relaxed);
-                Ok(buf)
-            }
-        }
-    }
+    let mut buf = Vec::new();
+    encode_value_into(rec, &mut buf, opts)?;
+    Ok(buf)
 }
 
 /// Encode a borrowed record directly into the provided buffer, avoiding an intermediate allocation.
@@ -295,54 +192,7 @@ pub fn encode_record_ref_into_with(
     buf: &mut Vec<u8>,
     opts: EncodeOptions,
 ) -> Result<(), StreamError> {
-    let bincode_opts = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes();
-    buf.clear();
-    if opts.enable_compression {
-        let payload = bincode_opts.serialize(rec)?;
-        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
-            let compressed = lz4_flex::block::compress_prepend_size(&payload);
-            (FLAG_LZ4, compressed)
-        } else {
-            (0, payload)
-        };
-        buf.reserve(12 + body.len());
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        buf[6..8].copy_from_slice(&flags.to_be_bytes());
-        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&body);
-        Ok(())
-    } else {
-        // Single-pass: reserve header, serialize payload once, then backfill header
-        let hint = opts
-            .payload_hint
-            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        match opts.format {
-            PayloadFormat::Bincode => {
-                buf.reserve(12 + hint);
-                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-                bincode_opts.serialize_into(&mut *buf, rec)?;
-                let payload_len = (buf.len() - 12) as u32;
-                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-                // Update EMA
-                let len = payload_len as usize;
-                let prev = AVG_LEN.load(Ordering::Relaxed);
-                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-                AVG_LEN.store(next, Ordering::Relaxed);
-                Ok(())
-            }
-            #[cfg(feature = "rkyv")]
-            PayloadFormat::Rkyv => {
-                buf.reserve(12 + hint);
-                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-                bincode_opts.serialize_into(&mut *buf, rec)?;
-                let payload_len = (buf.len() - 12) as u32;
-                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-                Ok(())
-            }
-        }
-    }
+    encode_value_into(rec, buf, opts)
 }
 
 /// Encode into the provided buffer, reusing its capacity when possible.
@@ -352,12 +202,16 @@ pub fn encode_into_with(
     buf: &mut Vec<u8>,
     opts: EncodeOptions,
 ) -> Result<(), StreamError> {
+    encode_value_into(rec, buf, opts)
+}
+
+fn encode_value_into<T: Serialize>(val: &T, buf: &mut Vec<u8>, opts: EncodeOptions) -> Result<(), StreamError> {
     let bincode_opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes();
     buf.clear();
     if opts.enable_compression {
-        let payload = bincode_opts.serialize(rec)?;
+        let payload = bincode_opts.serialize(val)?;
         let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
             let compressed = lz4_flex::block::compress_prepend_size(&payload);
             (FLAG_LZ4, compressed)
@@ -369,24 +223,21 @@ pub fn encode_into_with(
         buf[6..8].copy_from_slice(&flags.to_be_bytes());
         buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
         buf.extend_from_slice(&body);
-        Ok(())
-    } else {
-        // Single-pass: reserve header, serialize payload once, then backfill header
-        let hint = opts
-            .payload_hint
-            .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        buf.reserve(12 + hint);
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        bincode_opts.serialize_into(&mut *buf, rec)?;
-        let payload_len = (buf.len() - 12) as u32;
-        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-        // Update EMA
-        let len = payload_len as usize;
-        let prev = AVG_LEN.load(Ordering::Relaxed);
-        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-        AVG_LEN.store(next, Ordering::Relaxed);
-        Ok(())
+        return Ok(());
     }
+    let hint = opts
+        .payload_hint
+        .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
+    buf.reserve(12 + hint);
+    buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+    bincode_opts.serialize_into(&mut *buf, val)?;
+    let payload_len = (buf.len() - 12) as u32;
+    buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+    let len = payload_len as usize;
+    let prev = AVG_LEN.load(Ordering::Relaxed);
+    let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+    AVG_LEN.store(next, Ordering::Relaxed);
+    Ok(())
 }
 
 pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {

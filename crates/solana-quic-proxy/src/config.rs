@@ -26,6 +26,10 @@ const DEFAULT_CONNECTION_WINDOW: u64 = 64 * 1024 * 1024;
 const DEFAULT_SEND_WINDOW: u64 = 64 * 1024 * 1024;
 const DEFAULT_DATAGRAM_BUFFER: usize = 2 * 1024 * 1024;
 const DEFAULT_CONFIG_PATH: &str = "ops/solana-quic-proxy.toml";
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1200;
+const DEFAULT_HEDGED_ATTEMPTS: u32 = 1;
+const DEFAULT_HEDGE_JITTER_MS: u64 = 25;
+const DEFAULT_ENABLE_EARLY_DATA: bool = true;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -105,6 +109,22 @@ pub struct CliArgs {
     /// Enable per-request HTTP tracing logs (adds overhead; default off).
     #[arg(long, default_value_t = false)]
     pub http_trace: bool,
+
+    /// Per-request deadline in milliseconds (0 disables timeout).
+    #[arg(long)]
+    pub request_timeout_ms: Option<u64>,
+
+    /// Number of hedged attempts per request (1 disables hedging).
+    #[arg(long)]
+    pub hedged_attempts: Option<u32>,
+
+    /// Delay before launching a hedged attempt in milliseconds.
+    #[arg(long)]
+    pub hedge_jitter_ms: Option<u64>,
+
+    /// Allow TLS early data (0-RTT) for idempotent RPCs.
+    #[arg(long)]
+    pub enable_early_data: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +147,10 @@ pub struct Config {
     pub lazy_connect: bool,
     pub config_path: Option<PathBuf>,
     pub http_trace: bool,
+    pub request_timeout: Option<Duration>,
+    pub hedged_attempts: u32,
+    pub hedge_jitter: Duration,
+    pub enable_early_data: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -148,6 +172,10 @@ struct FileConfig {
     datagram_recv_buffer: Option<usize>,
     lazy_connect: Option<bool>,
     http_trace: Option<bool>,
+    request_timeout_ms: Option<u64>,
+    hedged_attempts: Option<u32>,
+    hedge_jitter_ms: Option<u64>,
+    enable_early_data: Option<bool>,
 }
 
 impl Config {
@@ -217,6 +245,10 @@ impl Config {
             datagram_recv = ?self.datagram_recv_buffer,
             lazy_connect = self.lazy_connect,
             http_trace = self.http_trace,
+            request_timeout = ?self.request_timeout,
+            hedged_attempts = self.hedged_attempts,
+            hedge_jitter_ms = self.hedge_jitter.as_millis(),
+            enable_early_data = self.enable_early_data,
             "solana-quic-proxy configuration"
         );
     }
@@ -293,6 +325,32 @@ fn merge(cli: &CliArgs, file_cfg: Option<(PathBuf, FileConfig)>) -> Result<Confi
     let lazy_connect = cli.lazy_connect || file_cfg.lazy_connect.unwrap_or(false);
     let http_trace = cli.http_trace || file_cfg.http_trace.unwrap_or(false);
 
+    let request_timeout_ms = pick(
+        cli.request_timeout_ms,
+        file_cfg.request_timeout_ms,
+        DEFAULT_REQUEST_TIMEOUT_MS,
+    );
+    let request_timeout = if request_timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(request_timeout_ms))
+    };
+    let hedged_attempts = pick(
+        cli.hedged_attempts,
+        file_cfg.hedged_attempts,
+        DEFAULT_HEDGED_ATTEMPTS,
+    );
+    let hedge_jitter_ms = pick(
+        cli.hedge_jitter_ms,
+        file_cfg.hedge_jitter_ms,
+        DEFAULT_HEDGE_JITTER_MS,
+    );
+    let enable_early_data = pick(
+        cli.enable_early_data,
+        file_cfg.enable_early_data,
+        DEFAULT_ENABLE_EARLY_DATA,
+    );
+
     Ok(Config {
         listen,
         upstream,
@@ -312,6 +370,10 @@ fn merge(cli: &CliArgs, file_cfg: Option<(PathBuf, FileConfig)>) -> Result<Confi
         lazy_connect,
         config_path: cfg_path,
         http_trace,
+        request_timeout,
+        hedged_attempts,
+        hedge_jitter: Duration::from_millis(hedge_jitter_ms),
+        enable_early_data,
     })
 }
 

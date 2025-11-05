@@ -12,7 +12,7 @@ use rkyv;
 use rkyv::de::deserializers::SharedDeserializeMap;
 #[cfg(all(feature = "rkyv", feature = "kafka"))]
 use rkyv::Deserialize;
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::ser::{SerializeMap, Serializer};
 use socket2::SockRef;
@@ -520,6 +520,7 @@ async fn main() -> Result<()> {
                 .max_frame_bytes
                 .or(default_mfb)
                 .unwrap_or(16 * 1024 * 1024);
+            gauge!("ultra_max_frame_bytes").set(max_frame_bytes as f64);
 
             loop {
                 tokio::select! {
@@ -598,6 +599,7 @@ async fn handle_client(
                 let len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
                 if len > max_frame_bytes {
                     counter!("ultra_frame_too_large_total").increment(1);
+                    histogram!("ultra_frame_oversize_bytes").record(len as f64);
                     counter!("ultra_resync_events_total").increment(1);
                     RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
                     // Resync by searching for the next magic after the current one to avoid re-parsing the same header

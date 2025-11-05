@@ -8,6 +8,8 @@
   "batch_bytes_max": 1048576,
   "flush_after_ms": 0,
   "write_timeout_ms": 200,
+  "write_spin_cap_us": 300,
+  "write_sleep_backoff_us": 750,
   "pin_core": 2,
   "rt_priority": 90,
   "sched_policy": "fifo",

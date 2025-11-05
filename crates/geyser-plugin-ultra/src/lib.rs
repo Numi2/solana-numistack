@@ -17,7 +17,7 @@ use faststreams::{
     encode_into_with, encode_record_ref_into_with, AccountUpdateRef, BlockMeta, EncodeOptions,
     Record, RecordRef, TxUpdate,
 };
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use queue::{Producer, SpscRing};
@@ -39,7 +39,7 @@ struct Ultra {
     shutdown: Arc<AtomicBool>,
     streams: Streams,
     logger_set: Mutex<bool>,
-    pool: Option<Arc<pool::BufferPool>>,
+    pools: Vec<Arc<pool::BufferPool>>,
     metrics_seq: AtomicU64,
     writer_handles: Vec<thread::JoinHandle<()>>,
     metrics_handle: Option<PrometheusHandle>,
@@ -78,7 +78,7 @@ impl Ultra {
                 slots: true,
             },
             logger_set: Mutex::new(false),
-            pool: None,
+            pools: Vec::new(),
             metrics_seq: AtomicU64::new(0),
             writer_handles: Vec::new(),
             metrics_handle: None,
@@ -148,20 +148,15 @@ impl Ultra {
         self.meter.inc_enqueued(1);
     }
 
-    fn record_drop_sampled(&self, reason: &'static str) {
+    fn record_drop_shard(&self, reason: &'static str, shard: usize, by: u64) {
         match reason {
-            "queue_full" => self.meter.inc_dropped_queue_full(1),
-            "no_buf" => self.meter.inc_dropped_no_buf(1),
-            _ => self.meter.inc_dropped_queue_full(1),
+            "backpressure" | "queue_full" => self.meter.inc_dropped_queue_full(by),
+            "no_buf" => self.meter.inc_dropped_no_buf(by),
+            "oversize" | "serialization_error" | "write_blocked" => {},
+            _ => {},
         }
-    }
-
-    fn record_drop_unsampled(&self, reason: &'static str) {
-        match reason {
-            "queue_full" => self.meter.inc_dropped_queue_full(1),
-            "no_buf" => self.meter.inc_dropped_no_buf(1),
-            _ => self.meter.inc_dropped_queue_full(1),
-        }
+        counter!("ultra_dropped_total", "reason" => reason, "shard" => shard.to_string())
+            .increment(by);
     }
 
     fn record_queue_depth(&self, idx: usize) {
@@ -267,10 +262,12 @@ impl GeyserPlugin for Ultra {
             }
         }
 
-        // Initialize reusable buffer pool sized for bursts
+        // Initialize per-writer reusable buffer pools sized for bursts
         let pool_default_cap = cfg.pool_default_cap;
-        let pool = pool::BufferPool::new(cfg.pool_items_max, pool_default_cap);
-        gauge!("ultra_pool_cap_bytes").set(pool_default_cap as f64);
+        let mut pools: Vec<Arc<pool::BufferPool>> = Vec::with_capacity(cfg.writer_threads);
+        for _ in 0..cfg.writer_threads {
+            pools.push(pool::BufferPool::new(cfg.pool_items_max, pool_default_cap));
+        }
 
         let mut producers = Vec::with_capacity(cfg.writer_threads);
         let mut handles = Vec::with_capacity(cfg.writer_threads);
@@ -295,7 +292,7 @@ impl GeyserPlugin for Ultra {
         self.streams = cfg.streams.clone();
         self.producers = producers;
         self.cfg = Some(cfg);
-        self.pool = Some(pool);
+        self.pools = pools;
         self.writer_handles = handles;
 
         // Spawn low-priority metrics flusher if metrics exporter enabled
@@ -409,16 +406,28 @@ impl GeyserPlugin for Ultra {
             rent_epoch,
             data,
         });
-        if let Some(pool) = &self.pool {
+        let idx = match self.writer_index_for_bytes(&pk_bytes) {
+            Some(i) => i,
+            None => {
+                // No writers; shed this key temporarily to reduce encode pressure.
+                self.mark_shed_account(pk_bytes);
+                return Ok(());
+            }
+        };
+        if let Some(pool) = self.pools.get(idx) {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    match encode_record_ref_into_with(&aref, buf, EncodeOptions::latency_uds()) {
+                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let cap_hint = self
+                        .cfg
+                        .as_ref()
+                        .map(|c| c.pool_default_cap)
+                        .unwrap_or(64 * 1024)
+                        .saturating_sub(12);
+                    let mut opts = EncodeOptions::latency_uds();
+                    opts.payload_hint = Some(cap_hint);
+                    match encode_record_ref_into_with(&aref, buf, opts) {
                         Ok(()) => {
                             if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "account")
@@ -426,17 +435,16 @@ impl GeyserPlugin for Ultra {
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
                                     histogram!("ultra_record_bytes", "kind" => "account")
                                         .record(sz as f64);
+                                    if let Some(cfg) = &self.cfg {
+                                        if sz > cfg.pool_default_cap {
+                                            // Oversize frame; drop
+                                            drop(pb);
+                                            self.record_drop_shard("oversize", idx, 1);
+                                            return Ok(());
+                                        }
+                                    }
                                 }
                             }
-                            let idx = match self.writer_index_for_bytes(&pk_bytes) {
-                                Some(i) => i,
-                                None => {
-                                    // No writers; shed this key temporarily to reduce encode pressure.
-                                    self.mark_shed_account(pk_bytes);
-                                    self.record_drop_sampled("queue_full");
-                                    return Ok(());
-                                }
-                            };
                             match self.try_enqueue(idx, pb) {
                                 Ok(()) => {
                                     self.record_queue_depth(idx);
@@ -444,12 +452,13 @@ impl GeyserPlugin for Ultra {
                                 }
                                 Err(buf) => {
                                     drop(buf);
-                                    self.record_drop_sampled("queue_full");
+                                    self.record_drop_shard("backpressure", idx, 1);
                                 }
                             }
                         }
                         Err(e) => {
                             self.meter.inc_encode_error_account(1);
+                            self.record_drop_shard("serialization_error", idx, 1);
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                             if (v & 0xFF) == 0 {
                                 debug!(target = "ultra.encode", "account encode failed: {e}");
@@ -458,7 +467,7 @@ impl GeyserPlugin for Ultra {
                     }
                 }
             } else {
-                self.record_drop_unsampled("no_buf");
+                self.record_drop_shard("no_buf", idx, 1);
             }
         }
         Ok(())
@@ -491,16 +500,24 @@ impl GeyserPlugin for Ultra {
             err: err_opt,
             vote: is_vote,
         });
-        if let Some(pool) = &self.pool {
+        let idx = match self.writer_index_for_bytes(&sig_bytes) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        if let Some(pool) = self.pools.get(idx) {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
+                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let cap_hint = self
+                        .cfg
+                        .as_ref()
+                        .map(|c| c.pool_default_cap)
+                        .unwrap_or(64 * 1024)
+                        .saturating_sub(12);
+                    let mut opts = EncodeOptions::latency_uds();
+                    opts.payload_hint = Some(cap_hint);
+                    match encode_into_with(&rec, buf, opts) {
                         Ok(()) => {
                             if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "tx")
@@ -508,15 +525,15 @@ impl GeyserPlugin for Ultra {
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
                                     histogram!("ultra_record_bytes", "kind" => "tx")
                                         .record(sz as f64);
+                                    if let Some(cfg) = &self.cfg {
+                                        if sz > cfg.pool_default_cap {
+                                            drop(pb);
+                                            self.record_drop_shard("oversize", idx, 1);
+                                            return Ok(());
+                                        }
+                                    }
                                 }
                             }
-                            let idx = match self.writer_index_for_bytes(&sig_bytes) {
-                                Some(i) => i,
-                                None => {
-                                    self.record_drop_sampled("queue_full");
-                                    return Ok(());
-                                }
-                            };
                             match self.try_enqueue(idx, pb) {
                                 Ok(()) => {
                                     self.record_queue_depth(idx);
@@ -524,12 +541,13 @@ impl GeyserPlugin for Ultra {
                                 }
                                 Err(buf) => {
                                     drop(buf);
-                                    self.record_drop_sampled("queue_full");
+                                    self.record_drop_shard("backpressure", idx, 1);
                                 }
                             }
                         }
                         Err(e) => {
                             self.meter.inc_encode_error_tx(1);
+                            self.record_drop_shard("serialization_error", idx, 1);
                             let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
                             if (v & 0xFF) == 0 {
                                 debug!(target = "ultra.encode", "tx encode failed: {e}");
@@ -538,7 +556,7 @@ impl GeyserPlugin for Ultra {
                     }
                 }
             } else {
-                self.record_drop_unsampled("no_buf");
+                self.record_drop_shard("no_buf", idx, 1);
             }
         }
         Ok(())
@@ -557,16 +575,21 @@ impl GeyserPlugin for Ultra {
                 block_time_unix: b.block_time,
                 leader: None, // Leader info not available in new API
             });
-            if let Some(pool) = &self.pool {
+            let idx = match self.writer_index_for_u64(b.slot) { Some(i) => i, None => return Ok(()) };
+            if let Some(pool) = self.pools.get(idx) {
                 if let Some(mut pb) = pool.try_get() {
                     if let Some(buf) = pb.inner_mut() {
                         let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                        let maybe_t0 = if (v & 0xFF) == 0 {
-                            Some(Instant::now())
-                        } else {
-                            None
-                        };
-                        match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
+                        let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                        let cap_hint = self
+                            .cfg
+                            .as_ref()
+                            .map(|c| c.pool_default_cap)
+                            .unwrap_or(64 * 1024)
+                            .saturating_sub(12);
+                        let mut opts = EncodeOptions::latency_uds();
+                        opts.payload_hint = Some(cap_hint);
+                        match encode_into_with(&rec, buf, opts) {
                             Ok(()) => {
                                 if let Some(t0) = maybe_t0 {
                                     histogram!("ultra_encode_ns", "kind" => "block")
@@ -574,15 +597,15 @@ impl GeyserPlugin for Ultra {
                                     if let Some(sz) = pb.as_slice().map(|s| s.len()) {
                                         histogram!("ultra_record_bytes", "kind" => "block")
                                             .record(sz as f64);
+                                        if let Some(cfg) = &self.cfg {
+                                            if sz > cfg.pool_default_cap {
+                                                drop(pb);
+                                                self.record_drop_shard("oversize", idx, 1);
+                                                return Ok(());
+                                            }
+                                        }
                                     }
                                 }
-                                let idx = match self.writer_index_for_u64(b.slot) {
-                                    Some(i) => i,
-                                    None => {
-                                        self.record_drop_sampled("queue_full");
-                                        return Ok(());
-                                    }
-                                };
                                 match self.try_enqueue(idx, pb) {
                                     Ok(()) => {
                                         self.record_queue_depth(idx);
@@ -590,12 +613,13 @@ impl GeyserPlugin for Ultra {
                                     }
                                     Err(buf) => {
                                         drop(buf);
-                                        self.record_drop_sampled("queue_full");
+                                        self.record_drop_shard("backpressure", idx, 1);
                                     }
                                 }
                             }
                             Err(e) => {
                                 self.meter.inc_encode_error_block(1);
+                                self.record_drop_shard("serialization_error", idx, 1);
                                 if maybe_t0.is_some() {
                                     debug!(target = "ultra.encode", "block encode failed: {e}");
                                 }
@@ -603,7 +627,7 @@ impl GeyserPlugin for Ultra {
                         }
                     }
                 } else {
-                    self.record_drop_unsampled("no_buf");
+                    self.record_drop_shard("no_buf", idx, 1);
                 }
             }
         }
@@ -633,16 +657,21 @@ impl GeyserPlugin for Ultra {
             parent,
             status: st,
         };
-        if let Some(pool) = &self.pool {
+        let idx = match self.writer_index_for_u64(slot) { Some(i) => i, None => return Ok(()) };
+        if let Some(pool) = self.pools.get(idx) {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    match encode_into_with(&rec, buf, EncodeOptions::latency_uds()) {
+                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let cap_hint = self
+                        .cfg
+                        .as_ref()
+                        .map(|c| c.pool_default_cap)
+                        .unwrap_or(64 * 1024)
+                        .saturating_sub(12);
+                    let mut opts = EncodeOptions::latency_uds();
+                    opts.payload_hint = Some(cap_hint);
+                    match encode_into_with(&rec, buf, opts) {
                         Ok(()) => {
                             if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "slot")
@@ -650,15 +679,15 @@ impl GeyserPlugin for Ultra {
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
                                     histogram!("ultra_record_bytes", "kind" => "slot")
                                         .record(sz as f64);
+                                    if let Some(cfg) = &self.cfg {
+                                        if sz > cfg.pool_default_cap {
+                                            drop(pb);
+                                            self.record_drop_shard("oversize", idx, 1);
+                                            return Ok(());
+                                        }
+                                    }
                                 }
                             }
-                            let idx = match self.writer_index_for_u64(slot) {
-                                Some(i) => i,
-                                None => {
-                                    self.record_drop_sampled("queue_full");
-                                    return Ok(());
-                                }
-                            };
                             match self.try_enqueue(idx, pb) {
                                 Ok(()) => {
                                     self.record_queue_depth(idx);
@@ -666,12 +695,13 @@ impl GeyserPlugin for Ultra {
                                 }
                                 Err(buf) => {
                                     drop(buf);
-                                    self.record_drop_sampled("queue_full");
+                                    self.record_drop_shard("backpressure", idx, 1);
                                 }
                             }
                         }
                         Err(e) => {
                             self.meter.inc_encode_error_slot(1);
+                            self.record_drop_shard("serialization_error", idx, 1);
                             if maybe_t0.is_some() {
                                 debug!(target = "ultra.encode", "slot encode failed: {e}");
                             }
@@ -679,24 +709,28 @@ impl GeyserPlugin for Ultra {
                     }
                 }
             } else {
-                self.record_drop_unsampled("no_buf");
+                self.record_drop_shard("no_buf", idx, 1);
             }
         }
         Ok(())
     }
 
     fn notify_end_of_startup(&self) -> GeyserResult<()> {
-        if let Some(pool) = &self.pool {
+        let idx = self.writer_index_for_u64(0).unwrap_or(0);
+        if let Some(pool) = self.pools.get(idx) {
             if let Some(mut pb) = pool.try_get() {
                 if let Some(buf) = pb.inner_mut() {
                     let v = self.metrics_seq.fetch_add(1, Ordering::Relaxed);
-                    let maybe_t0 = if (v & 0xFF) == 0 {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    match encode_into_with(&Record::EndOfStartup, buf, EncodeOptions::latency_uds())
-                    {
+                    let maybe_t0 = if (v & 0xFF) == 0 { Some(Instant::now()) } else { None };
+                    let cap_hint = self
+                        .cfg
+                        .as_ref()
+                        .map(|c| c.pool_default_cap)
+                        .unwrap_or(64 * 1024)
+                        .saturating_sub(12);
+                    let mut opts = EncodeOptions::latency_uds();
+                    opts.payload_hint = Some(cap_hint);
+                    match encode_into_with(&Record::EndOfStartup, buf, opts) {
                         Ok(()) => {
                             if let Some(t0) = maybe_t0 {
                                 histogram!("ultra_encode_ns", "kind" => "eos")
@@ -704,27 +738,29 @@ impl GeyserPlugin for Ultra {
                                 if let Some(sz) = pb.as_slice().map(|s| s.len()) {
                                     histogram!("ultra_record_bytes", "kind" => "eos")
                                         .record(sz as f64);
+                                    if let Some(cfg) = &self.cfg {
+                                        if sz > cfg.pool_default_cap {
+                                            drop(pb);
+                                            self.record_drop_shard("oversize", idx, 1);
+                                            return Ok(());
+                                        }
+                                    }
                                 }
                             }
-                            if self.writer_count() == 0 {
-                                drop(pb);
-                                self.record_drop_sampled("queue_full");
-                            } else {
-                                let idx = self.writer_index_for_u64(0).unwrap_or(0);
-                                match self.try_enqueue(idx, pb) {
-                                    Ok(()) => {
-                                        self.record_queue_depth(idx);
-                                        self.record_enqueue_success();
-                                    }
-                                    Err(buf) => {
-                                        drop(buf);
-                                        self.record_drop_sampled("queue_full");
-                                    }
+                            match self.try_enqueue(idx, pb) {
+                                Ok(()) => {
+                                    self.record_queue_depth(idx);
+                                    self.record_enqueue_success();
+                                }
+                                Err(buf) => {
+                                    drop(buf);
+                                    self.record_drop_shard("backpressure", idx, 1);
                                 }
                             }
                         }
                         Err(e) => {
                             self.meter.inc_encode_error_eos(1);
+                            self.record_drop_shard("serialization_error", idx, 1);
                             if maybe_t0.is_some() {
                                 debug!(target = "ultra.encode", "eos encode failed: {e}");
                             }
@@ -732,7 +768,7 @@ impl GeyserPlugin for Ultra {
                     }
                 }
             } else {
-                self.record_drop_unsampled("no_buf");
+                self.record_drop_shard("no_buf", idx, 1);
             }
         }
         Ok(())
@@ -809,6 +845,8 @@ mod tests {
             shed_throttle_ms: 25,
             write_spin_cap_us: 300,
             write_sleep_backoff_us: 750,
+            use_seqpacket: cfg!(target_os = "linux"),
+            lock_memory: false,
         }
     }
 

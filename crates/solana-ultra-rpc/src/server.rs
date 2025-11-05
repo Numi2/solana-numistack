@@ -2,6 +2,7 @@
 //! Top-level orchestration for the ultra RPC server.
 
 use std::sync::Arc;
+use std::thread::JoinHandle as ThreadJoinHandle;
 
 use anyhow::{anyhow, Context, Result};
 use axum::{extract::State, http::StatusCode, routing::get, Router};
@@ -22,6 +23,7 @@ pub struct UltraRpcServerHandle {
     quic: Option<QuicRpcServer>,
     tasks: Vec<JoinHandle<anyhow::Result<()>>>,
     canceller: CancellationToken,
+    metrics_thread: Option<ThreadJoinHandle<()>>,
 }
 
 impl UltraRpcServerHandle {
@@ -33,6 +35,9 @@ impl UltraRpcServerHandle {
         }
         for handle in self.tasks.drain(..) {
             handle.abort();
+        }
+        if let Some(thread) = self.metrics_thread.take() {
+            let _ = thread.join();
         }
         Ok(())
     }
@@ -76,28 +81,44 @@ pub async fn launch_server(config: UltraRpcConfig) -> Result<UltraRpcServerHandl
         }
     }));
 
-    // Metrics endpoint.
+    // Metrics endpoint on a dedicated thread with its own runtime.
     let telemetry_state = telemetry.clone();
     let metrics_addr = config.metrics_bind;
     let metrics_cancel = canceller.clone();
-    tasks.push(tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-        info!(addr = %metrics_addr, "metrics endpoint ready");
-        let app = Router::new()
-            .route("/metrics", get(metrics_handler))
-            .with_state(telemetry_state);
-        tokio::select! {
-            _ = metrics_cancel.cancelled() => Ok(()),
-            res = axum::serve(listener, app.into_make_service()) => {
-                res.map_err(|err| anyhow!(err))
-            }
-        }
-    }));
+    let metrics_thread = std::thread::Builder::new()
+        .name("metrics".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("metrics runtime");
+            rt.block_on(async move {
+                match tokio::net::TcpListener::bind(metrics_addr).await {
+                    Ok(listener) => {
+                        info!(addr = %metrics_addr, "metrics endpoint ready");
+                        let app = Router::new()
+                            .route("/metrics", get(metrics_handler))
+                            .with_state(telemetry_state);
+                        let serve = axum::serve(listener, app.into_make_service());
+                        tokio::select! {
+                            _ = metrics_cancel.cancelled() => {},
+                            _ = serve => {},
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to bind metrics endpoint");
+                    }
+                }
+            });
+        })
+        .ok();
 
     Ok(UltraRpcServerHandle {
         quic: Some(quic),
         tasks,
         canceller,
+        metrics_thread,
     })
 }
 

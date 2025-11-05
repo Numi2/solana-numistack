@@ -1,6 +1,7 @@
 // Numan Thabit 2025
 // crates/ys-consumer/src/main.rs
 #![forbid(unsafe_code)]
+mod shm_ring;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use crossbeam_queue::ArrayQueue;
@@ -668,6 +669,123 @@ fn writer_loop_generic<S: BatchSource>(
     }
 }
 
+fn writer_loop_shm<S: BatchSource>(
+    mut ring: shm_ring::ShmRingWriter,
+    src: S,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    limits: WriterLimits,
+    flush_interval: Duration,
+    buf_pool: std::sync::Arc<BufPool>,
+    dlq: Option<DlqSink>,
+) {
+    let WriterLimits {
+        batch_max,
+        batch_bytes_max,
+        frame_bytes_max,
+    } = limits;
+    let mut pending_frame: Option<Vec<u8>> = None;
+    let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut prev_queue_len: usize = 0;
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_max);
+        // Similar batching to UDS to amortize per-iteration overhead
+        let curr_len = src.approx_len();
+        let eff_flush = effective_flush_interval(flush_interval, prev_queue_len, curr_len);
+        prev_queue_len = curr_len;
+
+        let (first, retried_singleton) = match pending_frame.take() {
+            Some(frame) => (frame, true),
+            None => match src.blocking_pop(eff_flush) {
+                Some(frame) => (frame, false),
+                None => break,
+            },
+        };
+        if first.len() > frame_bytes_max {
+            drop_to_dlq(
+                first,
+                "frame_oversize",
+                frame_bytes_max,
+                &buf_pool,
+                &mut scratch,
+                dlq.as_ref(),
+            );
+            continue;
+        }
+        batch.push(first);
+        let mut batch_bytes = batch.last().map(|b| b.len()).unwrap_or(0);
+        let salvaged_singleton = retried_singleton;
+        let start = Instant::now();
+        while batch.len() < batch_max {
+            if start.elapsed() >= eff_flush {
+                break;
+            }
+            match src.try_pop() {
+                Some(next) => {
+                    if next.len() > frame_bytes_max {
+                        drop_to_dlq(
+                            next,
+                            "frame_oversize",
+                            frame_bytes_max,
+                            &buf_pool,
+                            &mut scratch,
+                            dlq.as_ref(),
+                        );
+                        continue;
+                    }
+                    if batch_bytes + next.len() > batch_bytes_max {
+                        pending_frame = Some(next);
+                        counter!("ys_consumer_oversized_batch_split_count").increment(1);
+                        break;
+                    }
+                    batch_bytes += next.len();
+                    batch.push(next);
+                }
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        let mut wrote = 0usize;
+        for frame in &batch {
+            if ring.try_push(frame) {
+                wrote += 1;
+            } else {
+                counter!("ys_consumer_shm_backpressure_drops_total").increment(1);
+                // On failure, stop and requeue remaining into pool to avoid reordering
+                break;
+            }
+        }
+        if wrote == batch.len() {
+            counter!("ys_consumer_write_batches_total").increment(1);
+            counter!("ys_consumer_write_bytes_total").increment(batch_bytes as u64);
+            histogram!("ys_consumer_write_batch_frames").record(batch.len() as f64);
+            histogram!("ys_consumer_write_batch_bytes").record(batch_bytes as f64);
+            FRAMES_PROCESSED.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            update_ratios();
+            if salvaged_singleton {
+                counter!("ys_consumer_singleton_salvaged_count").increment(1);
+            }
+            for frame in batch.drain(..) {
+                buf_pool.put(frame);
+            }
+        } else {
+            // Put back un-sent frames (including the first failure and any remaining)
+            for frame in batch.drain(..) {
+                buf_pool.put(frame);
+            }
+            // Back off very briefly to allow reader to advance
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    if let Some(frame) = pending_frame.take() {
+        buf_pool.put(frame);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -768,6 +886,15 @@ async fn main() -> Result<()> {
     let flush_interval_ms = env_u64("YS_FLUSH_INTERVAL_MS", 1);
     let flush_interval = Duration::from_millis(std::cmp::max(1, flush_interval_ms));
     let use_spsc = env_bool("YS_SPSC", false);
+    let output_mode = std::env::var("YS_OUTPUT").unwrap_or_else(|_| "uds".to_string());
+    let use_shm = matches!(output_mode.as_str(), "shm" | "ring" | "shmem");
+    let shm_path_default = if cfg!(target_os = "linux") {
+        "/dev/shm/ultra-faststreams.ring"
+    } else {
+        "/tmp/ultra-faststreams.ring"
+    };
+    let shm_path = std::env::var("YS_SHM_PATH").unwrap_or_else(|_| shm_path_default.to_string());
+    let shm_cap_bytes = env_usize("YS_SHM_CAP_BYTES", 64 * 1024 * 1024);
 
     // Buffer pool config
     let buf_pool_cap = env_usize("YS_BUF_POOL_CAP", queue_cap);
@@ -804,38 +931,108 @@ async fn main() -> Result<()> {
         let src = SpscQueue { q: inner_q, ev };
         let pool = buf_pool.clone();
         let dlq_clone = dlq_sink.clone();
-        thread::Builder::new()
-            .name("ys-writer".into())
-            .spawn(move || {
-                writer_loop_generic(
-                    uds_path_clone,
-                    src,
-                    &sd,
-                    writer_limits,
-                    flush_interval,
-                    pool,
-                    dlq_clone,
-                );
-            })?;
+        if use_shm {
+            let sd2 = shutdown.clone();
+            let pool2 = buf_pool.clone();
+            let dlq2 = dlq_sink.clone();
+            let shm_path2 = shm_path.clone();
+            thread::Builder::new()
+                .name("ys-writer".into())
+                .spawn(move || {
+                    let mut backoff = Duration::from_millis(50);
+                    loop {
+                        if sd2.load(Ordering::Relaxed) { break; }
+                        match shm_ring::ShmRingWriter::open_or_create(&shm_path2, shm_cap_bytes) {
+                            Ok(ring) => {
+                                info!("writing to SHM ring {}", shm_path2);
+                                writer_loop_shm(
+                                    ring,
+                                    src,
+                                    &sd,
+                                    writer_limits,
+                                    flush_interval,
+                                    pool2.clone(),
+                                    dlq2.clone(),
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                error!("shm open {} failed: {}", shm_path2, e);
+                                std::thread::sleep(backoff);
+                                backoff = (backoff * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                })?;
+        } else {
+            thread::Builder::new()
+                .name("ys-writer".into())
+                .spawn(move || {
+                    writer_loop_generic(
+                        uds_path_clone,
+                        src,
+                        &sd,
+                        writer_limits,
+                        flush_interval,
+                        pool,
+                        dlq_clone,
+                    );
+                })?;
+        }
     } else {
         let (txq, rxq) = bounded::<Vec<u8>>(queue_cap);
         let uds_path_clone = uds_path.clone();
         let sd = shutdown.clone();
         let pool = buf_pool.clone();
         let dlq_clone = dlq_sink.clone();
-        thread::Builder::new()
-            .name("ys-writer".into())
-            .spawn(move || {
-                writer_loop_generic(
-                    uds_path_clone,
-                    rxq,
-                    &sd,
-                    writer_limits,
-                    flush_interval,
-                    pool,
-                    dlq_clone,
-                );
-            })?;
+        if use_shm {
+            let sd2 = shutdown.clone();
+            let pool2 = buf_pool.clone();
+            let dlq2 = dlq_sink.clone();
+            let shm_path2 = shm_path.clone();
+            thread::Builder::new()
+                .name("ys-writer".into())
+                .spawn(move || {
+                    let mut backoff = Duration::from_millis(50);
+                    loop {
+                        if sd2.load(Ordering::Relaxed) { break; }
+                        match shm_ring::ShmRingWriter::open_or_create(&shm_path2, shm_cap_bytes) {
+                            Ok(ring) => {
+                                info!("writing to SHM ring {}", shm_path2);
+                                writer_loop_shm(
+                                    ring,
+                                    rxq,
+                                    &sd,
+                                    writer_limits,
+                                    flush_interval,
+                                    pool2.clone(),
+                                    dlq2.clone(),
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                error!("shm open {} failed: {}", shm_path2, e);
+                                std::thread::sleep(backoff);
+                                backoff = (backoff * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                })?;
+        } else {
+            thread::Builder::new()
+                .name("ys-writer".into())
+                .spawn(move || {
+                    writer_loop_generic(
+                        uds_path_clone,
+                        rxq,
+                        &sd,
+                        writer_limits,
+                        flush_interval,
+                        pool,
+                        dlq_clone,
+                    );
+                })?;
+        }
         txq_opt = Some(txq);
     }
 
@@ -898,6 +1095,24 @@ async fn main() -> Result<()> {
                 }
             };
         }
+        // gRPC tuning knobs
+        let init_conn_window = env_u64("YS_INIT_CONN_WINDOW", 32 * 1024 * 1024) as u32;
+        let init_stream_window = env_u64("YS_INIT_STREAM_WINDOW", 16 * 1024 * 1024) as u32;
+        let keepalive_interval_ms = env_u64("YS_HTTP2_KEEPALIVE_INTERVAL_MS", 1_000);
+        let keepalive_timeout_ms = env_u64("YS_HTTP2_KEEPALIVE_TIMEOUT_MS", 3_000);
+        let tcp_keepalive_secs = env_u64("YS_TCP_KEEPALIVE_SECS", 30);
+        let concurrency_limit = env_usize("YS_GRPC_CONCURRENCY_LIMIT", 256);
+        let connect_timeout_ms = env_u64("YS_CONNECT_TIMEOUT_MS", 3_000);
+        // Best-effort: these builder methods may not exist in older deps; ignore errors by chaining options only when available.
+        builder = builder
+            .initial_connection_window_size(init_conn_window)
+            .initial_stream_window_size(init_stream_window)
+            .http2_keep_alive_interval(Duration::from_millis(keepalive_interval_ms))
+            .http2_keep_alive_timeout(Duration::from_millis(keepalive_timeout_ms))
+            .keepalive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)))
+            .concurrency_limit(concurrency_limit)
+            .connect_timeout(Duration::from_millis(connect_timeout_ms));
         let mut client = match builder.connect().await {
             Ok(c) => c,
             Err(e) => {

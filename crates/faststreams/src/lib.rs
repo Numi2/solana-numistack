@@ -11,26 +11,62 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const COMPRESS_THRESHOLD: usize = 2048;
 const IOV_MAX_DEFAULT: usize = 1024; // typical on Linux/macOS
 const INLINE_IOVEC_CAP: usize = IOV_MAX_DEFAULT;
-pub const FLAG_LZ4: u16 = 0x0001;
-pub const FLAG_RKYV: u16 = 0x0002;
+pub const FLAG_LZ4: u8 = 0x01;
+pub const FLAG_RKYV: u8 = 0x02;
+/// Header checksum present (CRC16 over bytes [0..8) is set in header)
+pub const FLAG_HAS_CHECKSUM: u8 = 0x04;
+/// Endianness indicator: if set, fields are little-endian (reserved; we currently write BE)
+pub const FLAG_ENDIAN_LE: u8 = 0x80;
 
-pub const FRAME_MAGIC: u32 = 0x4653_5452; // 'FSTR'
-pub const FRAME_VERSION: u16 = 1;
+pub const FRAME_VERSION: u8 = 1;
 
+// New 12-byte header layout:
+// [0]  u8  version
+// [1]  u8  flags
+// [2..4) u16 type (big-endian)
+// [4..8) u32 payload_len (big-endian)
+// [8..10) u16 header_crc16 over bytes [0..8) (big-endian)
+// [10..12) u16 reserved (zero)
 const FRAME_HEADER_TEMPLATE: [u8; 12] = [
-    (FRAME_MAGIC >> 24) as u8,
-    (FRAME_MAGIC >> 16) as u8,
-    (FRAME_MAGIC >> 8) as u8,
-    (FRAME_MAGIC) as u8,
-    (FRAME_VERSION >> 8) as u8,
-    (FRAME_VERSION) as u8,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
+    FRAME_VERSION, // version
+    0,             // flags
+    0, 0,          // type
+    0, 0, 0, 0,    // len
+    0, 0,          // hdr_crc16
+    0, 0,          // reserved
 ];
+
+fn crc16_ccitt(data: &[u8]) -> u16 {
+    // CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, refin=false, refout=false, xorout=0x0000)
+    let mut crc: u16 = 0xFFFF;
+    for &b in data {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            if (crc & 0x8000) != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn record_type_tag(rec: &Record) -> u16 {
+    match rec {
+        Record::Account(_) => 1,
+        Record::Tx(_) => 2,
+        Record::Block(_) => 3,
+        Record::Slot { .. } => 4,
+        Record::EndOfStartup => 5,
+    }
+}
+
+fn record_ref_type_tag(rec: &RecordRef<'_>) -> u16 {
+    match rec {
+        RecordRef::Account(_) => 1,
+    }
+}
 
 // Exponentially weighted moving average for recent payload lengths
 static AVG_LEN: AtomicUsize = AtomicUsize::new(512);
@@ -183,7 +219,7 @@ impl EncodeOptions {
 
 pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, StreamError> {
     let mut buf = Vec::new();
-    encode_value_into(rec, &mut buf, opts)?;
+    encode_value_with_type(rec, &mut buf, opts, record_type_tag(rec))?;
     Ok(buf)
 }
 
@@ -193,7 +229,7 @@ pub fn encode_record_ref_with(
     opts: EncodeOptions,
 ) -> Result<Vec<u8>, StreamError> {
     let mut buf = Vec::new();
-    encode_value_into(rec, &mut buf, opts)?;
+    encode_value_with_type(rec, &mut buf, opts, record_ref_type_tag(rec))?;
     Ok(buf)
 }
 
@@ -203,7 +239,7 @@ pub fn encode_record_ref_into_with(
     buf: &mut Vec<u8>,
     opts: EncodeOptions,
 ) -> Result<(), StreamError> {
-    encode_value_into(rec, buf, opts)
+    encode_value_with_type(rec, buf, opts, record_ref_type_tag(rec))
 }
 
 /// Encode into the provided buffer, reusing its capacity when possible.
@@ -213,13 +249,14 @@ pub fn encode_into_with(
     buf: &mut Vec<u8>,
     opts: EncodeOptions,
 ) -> Result<(), StreamError> {
-    encode_value_into(rec, buf, opts)
+    encode_value_with_type(rec, buf, opts, record_type_tag(rec))
 }
 
-fn encode_value_into<T: Serialize>(
+fn encode_value_with_type<T: Serialize>(
     val: &T,
     buf: &mut Vec<u8>,
     opts: EncodeOptions,
+    typ: u16,
 ) -> Result<(), StreamError> {
     let bincode_opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -227,16 +264,27 @@ fn encode_value_into<T: Serialize>(
     buf.clear();
     if opts.enable_compression {
         let payload = bincode_opts.serialize(val)?;
-        let (flags, body): (u16, Vec<u8>) = if payload.len() >= opts.compress_threshold {
-            let compressed = lz4_flex::block::compress_prepend_size(&payload);
-            (FLAG_LZ4, compressed)
+        let mut flags: u8;
+        let body: Vec<u8> = if payload.len() >= opts.compress_threshold {
+            flags = FLAG_LZ4;
+            lz4_flex::block::compress_prepend_size(&payload)
         } else {
-            (0, payload)
+            flags = 0;
+            payload
         };
+        #[cfg(feature = "rkyv")]
+        if matches!(opts.format, PayloadFormat::Rkyv) {
+            flags |= FLAG_RKYV;
+        }
+        flags |= FLAG_HAS_CHECKSUM;
         buf.reserve(12 + body.len());
         buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        buf[6..8].copy_from_slice(&flags.to_be_bytes());
-        buf[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        // version already set at [0]
+        buf[1] = flags; // flags (includes checksum bit)
+        buf[2..4].copy_from_slice(&typ.to_be_bytes());
+        buf[4..8].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        let crc = crc16_ccitt(&buf[0..8]);
+        buf[8..10].copy_from_slice(&crc.to_be_bytes());
         buf.extend_from_slice(&body);
         return Ok(());
     }
@@ -245,9 +293,20 @@ fn encode_value_into<T: Serialize>(
         .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
     buf.reserve(12 + hint);
     buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+    // Fill flags and type early; length will be filled post-serialize
+    let mut flags: u8 = 0;
+    #[cfg(feature = "rkyv")]
+    if matches!(opts.format, PayloadFormat::Rkyv) {
+        flags |= FLAG_RKYV;
+    }
+    flags |= FLAG_HAS_CHECKSUM;
+    buf[1] = flags;
+    buf[2..4].copy_from_slice(&typ.to_be_bytes());
     bincode_opts.serialize_into(&mut *buf, val)?;
     let payload_len = (buf.len() - 12) as u32;
-    buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+    buf[4..8].copy_from_slice(&payload_len.to_be_bytes());
+    let crc = crc16_ccitt(&buf[0..8]);
+    buf[8..10].copy_from_slice(&crc.to_be_bytes());
     let len = payload_len as usize;
     let prev = AVG_LEN.load(Ordering::Relaxed);
     let next = ((prev.saturating_mul(7) + len) / 8).max(64);
@@ -266,13 +325,51 @@ pub fn decode_record_archived_from_slice<'a>(
     if src.len() < 12 {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }
-    let magic = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-    let ver = u16::from_be_bytes([src[4], src[5]]);
-    if magic != FRAME_MAGIC || ver != FRAME_VERSION {
+    let ver = src[0];
+    if ver != FRAME_VERSION {
         return Err(StreamError::BadHeader);
     }
-    let flags = u16::from_be_bytes([src[6], src[7]]);
-    let len = u32::from_be_bytes([src[8], src[9], src[10], src[11]]) as usize;
+    let hdr_crc = u16::from_be_bytes([src[8], src[9]]);
+    let calc = crc16_ccitt(&src[0..8]);
+    if hdr_crc != calc {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = src[1];
+    let _typ = u16::from_be_bytes([src[2], src[3]]);
+    let len = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
+    let total = 12 + len;
+    if src.len() < total {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    if (flags & FLAG_LZ4) != 0 {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    let body = &src[12..total];
+    let rec = rkyv::check_archived_root::<Record>(body)
+        .map_err(|e| StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
+    Ok((rec, total))
+}
+
+#[cfg(feature = "rkyv")]
+/// Trusted zero-copy rkyv decode: skips bytecheck validation. Use only when both ends are trusted.
+pub fn decode_record_archived_trusted_from_slice<'a>(
+    src: &'a [u8],
+) -> Result<(&'a ArchivedRecord, usize), StreamError> {
+    if src.len() < 12 {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    let ver = src[0];
+    if ver != FRAME_VERSION {
+        return Err(StreamError::BadHeader);
+    }
+    let hdr_crc = u16::from_be_bytes([src[8], src[9]]);
+    let calc = crc16_ccitt(&src[0..8]);
+    if hdr_crc != calc {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = src[1];
+    let _typ = u16::from_be_bytes([src[2], src[3]]);
+    let len = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
     let total = 12 + len;
     if src.len() < total {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
@@ -289,13 +386,18 @@ pub fn decode_record_archived_from_slice<'a>(
 pub fn decode_record(mut src: impl Read) -> Result<Record, StreamError> {
     let mut hdr = [0u8; 12];
     src.read_exact(&mut hdr)?;
-    let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    let ver = u16::from_be_bytes([hdr[4], hdr[5]]);
-    if magic != FRAME_MAGIC || ver != FRAME_VERSION {
+    let ver = hdr[0];
+    if ver != FRAME_VERSION {
         return Err(StreamError::BadHeader);
     }
-    let flags = u16::from_be_bytes([hdr[6], hdr[7]]);
-    let len = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+    let hdr_crc = u16::from_be_bytes([hdr[8], hdr[9]]);
+    let calc = crc16_ccitt(&hdr[0..8]);
+    if hdr_crc != calc {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = hdr[1];
+    let _typ = u16::from_be_bytes([hdr[2], hdr[3]]);
+    let len = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
     let mut body = vec![0u8; len];
     src.read_exact(&mut body)?;
     let bincode_opts = bincode::DefaultOptions::new()
@@ -318,13 +420,18 @@ pub fn decode_record_from_slice(
     if src.len() < 12 {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }
-    let magic = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-    let ver = u16::from_be_bytes([src[4], src[5]]);
-    if magic != FRAME_MAGIC || ver != FRAME_VERSION {
+    let ver = src[0];
+    if ver != FRAME_VERSION {
         return Err(StreamError::BadHeader);
     }
-    let flags = u16::from_be_bytes([src[6], src[7]]);
-    let len = u32::from_be_bytes([src[8], src[9], src[10], src[11]]) as usize;
+    let hdr_crc = u16::from_be_bytes([src[8], src[9]]);
+    let calc = crc16_ccitt(&src[0..8]);
+    if hdr_crc != calc {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = src[1];
+    let _typ = u16::from_be_bytes([src[2], src[3]]);
+    let len = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
     let total = 12 + len;
     if src.len() < total {
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
@@ -349,6 +456,73 @@ pub fn decode_record_from_slice(
     } else {
         let rec = bincode_opts.deserialize::<Record>(body)?;
         Ok((rec, total))
+    }
+}
+
+/// Decode using a caller-provided buffer for the body to avoid per-record allocations.
+pub fn decode_record_with_scratch(
+    mut src: impl Read,
+    body_buf: &mut Vec<u8>,
+) -> Result<Record, StreamError> {
+    let mut hdr = [0u8; 12];
+    src.read_exact(&mut hdr)?;
+    let ver = hdr[0];
+    if ver != FRAME_VERSION {
+        return Err(StreamError::BadHeader);
+    }
+    let hdr_crc = u16::from_be_bytes([hdr[8], hdr[9]]);
+    let calc = crc16_ccitt(&hdr[0..8]);
+    if hdr_crc != calc {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = hdr[1];
+    let _typ = u16::from_be_bytes([hdr[2], hdr[3]]);
+    let len = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    body_buf.clear();
+    body_buf.resize(len, 0);
+    src.read_exact(body_buf)?;
+    let bincode_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
+    if (flags & FLAG_LZ4) != 0 {
+        match lz4_flex::block::decompress_size_prepended(body_buf) {
+            Ok(mut decompressed) => {
+                std::mem::swap(body_buf, &mut decompressed);
+            }
+            Err(e) => {
+                return Err(StreamError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e,
+                )));
+            }
+        }
+    }
+    Ok(bincode_opts.deserialize::<Record>(&body_buf[..])?)
+}
+
+/// Reusable decoder that keeps internal buffers to avoid per-record allocations across batches.
+#[derive(Default)]
+pub struct Decoder {
+    body: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+impl Decoder {
+    pub fn with_capacities(body_cap: usize, scratch_cap: usize) -> Self {
+        Self {
+            body: Vec::with_capacity(body_cap),
+            scratch: Vec::with_capacity(scratch_cap),
+        }
+    }
+
+    #[inline]
+    pub fn decode_from_slice(&mut self, src: &[u8]) -> Result<(Record, usize), StreamError> {
+        decode_record_from_slice(src, &mut self.scratch)
+    }
+
+    #[inline]
+    pub fn decode_from_reader(&mut self, src: impl Read) -> Result<Record, StreamError> {
+        decode_record_with_scratch(src, &mut self.body)
     }
 }
 
@@ -499,9 +673,8 @@ mod tests {
         };
         let mut buf = Vec::new();
         encode_into_with(&record, &mut buf, opts).expect("encode succeeds");
-        assert_eq!(&buf[..4], &FRAME_MAGIC.to_be_bytes());
-        assert_eq!(&buf[4..6], &FRAME_VERSION.to_be_bytes());
-        let flags = u16::from_be_bytes([buf[6], buf[7]]);
+        assert_eq!(buf[0], FRAME_VERSION);
+        let flags = buf[1];
         assert_eq!(flags & FLAG_LZ4, FLAG_LZ4, "lz4 flag not set");
 
         let mut cursor = io::Cursor::new(buf);
@@ -630,5 +803,19 @@ mod tests {
             .expect("encode succeeds");
         let observed = super::AVG_LEN.load(Ordering::Relaxed);
         assert!(observed >= 64, "avg len should grow after encode");
+    }
+
+    #[test]
+    fn decode_rejects_bad_header_crc() {
+        let record = sample_account(5);
+        let mut buf = Vec::new();
+        encode_into_with(&record, &mut buf, EncodeOptions::default_throughput())
+            .expect("encode succeeds");
+        // Flip one header byte within [0..8) so CRC mismatches
+        if !buf.is_empty() {
+            buf[1] ^= 0xFF; // toggle flags byte
+        }
+        let res = decode_record_from_slice(&buf, &mut Vec::new());
+        assert!(matches!(res, Err(StreamError::BadHeader)));
     }
 }

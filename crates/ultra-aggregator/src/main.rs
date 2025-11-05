@@ -4,15 +4,15 @@
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 #[cfg(feature = "rkyv")]
-use faststreams::{decode_record_archived_from_slice, ArchivedRecord, FLAG_LZ4, FLAG_RKYV};
+use faststreams::{decode_record_archived_trusted_from_slice, ArchivedRecord, FLAG_LZ4, FLAG_RKYV};
 use faststreams::{decode_record_from_slice, Record};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 #[cfg(feature = "rkyv")]
 use rkyv;
-#[cfg(all(feature = "rkyv", feature = "kafka"))]
+#[cfg(feature = "rkyv")]
 use rkyv::de::deserializers::SharedDeserializeMap;
-#[cfg(all(feature = "rkyv", feature = "kafka"))]
+#[cfg(feature = "rkyv")]
 use rkyv::Deserialize;
 use serde::ser::{SerializeMap, Serializer};
 use socket2::SockRef;
@@ -36,6 +36,9 @@ struct KafkaCfg {
     topic_txs: String,
     topic_blocks: String,
     topic_slots: String,
+    /// Optional number of Kafka worker tasks; defaults to number of CPUs
+    #[serde(default)]
+    workers: Option<usize>,
 }
 
 // json_view removed: replaced with JsonEvent pipeline
@@ -76,52 +79,70 @@ impl KafkaSink {
         use rdkafka::producer::{FutureProducer, FutureRecord};
         use rdkafka::util::TokioRuntime;
         use rdkafka::ClientConfig;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(65_536);
-        tokio::spawn(async move {
-            let prod: FutureProducer<DefaultClientContext, TokioRuntime> = match ClientConfig::new()
-                .set("bootstrap.servers", &cfg.brokers)
-                .set("queue.buffering.max.messages", "2000000")
-                .set("queue.buffering.max.kbytes", "1048576")
-                .set("message.timeout.ms", "5000")
-                .create::<FutureProducer<DefaultClientContext, TokioRuntime>>()
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("kafka producer init failed: {e}");
-                    return;
-                }
-            };
-            while let Some(rec) = rx.recv().await {
-                let (topic, key) = match &rec {
-                    Record::Account(a) => {
-                        (&cfg.topic_accounts, bs58::encode(&a.pubkey).into_string())
-                    }
-                    Record::Tx(t) => (&cfg.topic_txs, bs58::encode(&t.signature).into_string()),
-                    Record::Block(b) => {
-                        let k = b
-                            .blockhash
-                            .map(|h| bs58::encode(h).into_string())
-                            .unwrap_or_default();
-                        (&cfg.topic_blocks, k)
-                    }
-                    Record::Slot { slot, .. } => (&cfg.topic_slots, slot.to_string()),
-                    Record::EndOfStartup => (&cfg.topic_slots, "eos".to_string()),
-                };
-                if let Ok(payload) = bincode::serialize(&rec) {
-                    let _ = prod
-                        .send(
-                            FutureRecord::to(topic).key(&key).payload(&payload),
-                            std::time::Duration::from_secs(1),
-                        )
-                        .await;
-                }
+        let (tx, rx) = tokio::sync::mpsc::channel::<Record>(65_536);
+        let workers = cfg
+            .workers
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2));
+        // Shared producer; FutureProducer is cheap to clone
+        let prod: FutureProducer<DefaultClientContext, TokioRuntime> = match ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("queue.buffering.max.messages", "2000000")
+            .set("queue.buffering.max.kbytes", "1048576")
+            .set("message.timeout.ms", "5000")
+            .create::<FutureProducer<DefaultClientContext, TokioRuntime>>()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("kafka producer init failed: {e}");
+                return Ok(Self { tx });
             }
-        });
+        };
+
+        let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+        for _ in 0..workers {
+            let rx_cl = rx.clone();
+            let prod_cl = prod.clone();
+            let cfg_cl = cfg.clone();
+            tokio::spawn(async move {
+                use metrics::gauge;
+                loop {
+                    let mut guard = rx_cl.lock().await;
+                    // Update depth gauge when we have the lock
+                    gauge!("ultra_kafka_queue_depth").set(guard.len() as f64);
+                    let opt = guard.recv().await;
+                    drop(guard);
+                    let Some(rec) = opt else { break };
+                    let (topic, key) = match &rec {
+                        Record::Account(a) => {
+                            (&cfg_cl.topic_accounts, bs58::encode(&a.pubkey).into_string())
+                        }
+                        Record::Tx(t) => (&cfg_cl.topic_txs, bs58::encode(&t.signature).into_string()),
+                        Record::Block(b) => {
+                            let k = b
+                                .blockhash
+                                .map(|h| bs58::encode(h).into_string())
+                                .unwrap_or_default();
+                            (&cfg_cl.topic_blocks, k)
+                        }
+                        Record::Slot { slot, .. } => (&cfg_cl.topic_slots, slot.to_string()),
+                        Record::EndOfStartup => (&cfg_cl.topic_slots, "eos".to_string()),
+                    };
+                    if let Ok(payload) = bincode::serialize(&rec) {
+                        let _ = prod_cl
+                            .send(
+                                FutureRecord::to(topic).key(&key).payload(&payload),
+                                std::time::Duration::from_secs(1),
+                            )
+                            .await;
+                    }
+                }
+            });
+        }
         Ok(Self { tx })
     }
 
-    fn try_send(&self, rec: Record) {
-        let _ = self.tx.try_send(rec);
+    fn try_send(&self, rec: Record) -> bool {
+        self.tx.try_send(rec).is_ok()
     }
 }
 
@@ -487,7 +508,7 @@ async fn main() -> Result<()> {
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    // Spawn one accept loop per listener
+    // Spawn one accept loop + output stage per listener (shard)
     for s in listeners_cfg {
         let json_clone = json_sink.clone();
         let default_recv = cfg.uds_recv_buf_bytes;
@@ -526,6 +547,43 @@ async fn main() -> Result<()> {
                 .unwrap_or(16 * 1024 * 1024);
             gauge!("ultra_max_frame_bytes").set(max_frame_bytes as f64);
 
+            // Create bounded MPSC for this shard; output stage consumes, producers never await
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Record>(65_536);
+
+            // Output stage: single-thread consumer per shard
+            let json_for_out = json_clone.clone();
+            #[cfg(feature = "kafka")]
+            let ks_for_out = ks.clone();
+            tokio::spawn(async move {
+                loop {
+                    use metrics::gauge;
+                    // update queue depth
+                    gauge!("ultra_output_queue_depth").set(out_rx.len() as f64);
+                    match out_rx.recv().await {
+                        Some(rec) => {
+                            // Tee to JSON (debug) and Kafka (off fast path)
+                            if let Some(js) = &json_for_out {
+                                let evt = json_event_owned_from_record(&rec);
+                                if !js.try_send(evt) {
+                                    counter!("ultra_json_dropped_total").increment(1);
+                                }
+                            }
+                            #[cfg(feature = "kafka")]
+                            if let Some(k) = &ks_for_out {
+                                if !k.try_send(rec) {
+                                    counter!("ultra_kafka_enqueue_dropped_total").increment(1);
+                                }
+                            }
+                            #[cfg(not(feature = "kafka"))]
+                            {
+                                let _ = rec; // no-op when no sinks enabled
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            });
+
             loop {
                 tokio::select! {
                     Ok((sock, _)) = listener.accept() => {
@@ -537,22 +595,12 @@ async fn main() -> Result<()> {
                                 gauge!("ultra_uds_recv_buf_bytes").set(actual as f64);
                             }
                         }
-                        let json_clone2 = json_clone.clone();
-                        #[cfg(feature = "kafka")] {
-                            let ks2 = ks.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_client(sock, json_clone2, max_frame_bytes, ks2).await {
-                                    error!("client error: {e:?}");
-                                }
-                            });
-                        }
-                        #[cfg(not(feature = "kafka"))] {
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_client(sock, json_clone2, max_frame_bytes).await {
-                                    error!("client error: {e:?}");
-                                }
-                            });
-                        }
+                        let out_clone = out_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(sock, max_frame_bytes, out_clone).await {
+                                error!("client error: {e:?}");
+                            }
+                        });
                     }
                 }
             }
@@ -567,9 +615,8 @@ async fn main() -> Result<()> {
 
 async fn handle_client(
     mut sock: UnixStream,
-    json: Option<JsonSink>,
     max_frame_bytes: usize,
-    #[cfg(feature = "kafka")] ks: Option<KafkaSink>,
+    out: tokio::sync::mpsc::Sender<Record>,
 ) -> Result<()> {
     let mut buf = BytesMut::with_capacity(1 << 20);
     let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
@@ -584,66 +631,75 @@ async fn handle_client(
         loop {
             // Safety pre-check: if header present and declared frame size is excessive, resync
             if buf.len() >= 12 {
-                let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let ver = u16::from_be_bytes([buf[4], buf[5]]);
-                if magic != faststreams::FRAME_MAGIC || ver != faststreams::FRAME_VERSION {
+                let ver = buf[0];
+                if ver != faststreams::FRAME_VERSION {
                     counter!("ultra_decode_bad_header_total").increment(1);
                     counter!("ultra_resync_events_total").increment(1);
                     RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
-                    let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
-                    if let Some(idx) = memchr::memmem::find(&buf[..], &magic_bytes) {
-                        if idx > 0 {
-                            buf.advance(idx);
-                        }
-                    } else {
-                        buf.clear();
-                    }
+                    // Drop one byte to attempt resync (no magic field in header)
+                    buf.advance(1);
                     break;
                 }
-                let len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+                // Validate header CRC16 over bytes [0..8)
+                let hdr_crc = u16::from_be_bytes([buf[8], buf[9]]);
+                let calc = {
+                    fn crc16_ccitt(mut data: &[u8]) -> u16 {
+                        let mut crc: u16 = 0xFFFF;
+                        while !data.is_empty() {
+                            crc ^= (data[0] as u16) << 8;
+                            for _ in 0..8 {
+                                if (crc & 0x8000) != 0 {
+                                    crc = (crc << 1) ^ 0x1021;
+                                } else {
+                                    crc <<= 1;
+                                }
+                            }
+                            data = &data[1..];
+                        }
+                        crc
+                    }
+                    crc16_ccitt(&buf[..8])
+                };
+                if hdr_crc != calc {
+                    counter!("ultra_decode_bad_header_total").increment(1);
+                    counter!("ultra_resync_events_total").increment(1);
+                    RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
+                    buf.advance(1);
+                    break;
+                }
+                let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
                 if len > max_frame_bytes {
                     counter!("ultra_frame_too_large_total").increment(1);
                     histogram!("ultra_frame_oversize_bytes").record(len as f64);
                     counter!("ultra_resync_events_total").increment(1);
                     RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
-                    // Resync by searching for the next magic after the current one to avoid re-parsing the same header
-                    let magic_bytes = faststreams::FRAME_MAGIC.to_be_bytes();
-                    if let Some(rel) = memchr::memmem::find(&buf[4..], &magic_bytes) {
-                        buf.advance(rel + 4);
-                    } else {
-                        buf.clear();
-                    }
+                    // Drop one byte to attempt resync
+                    buf.advance(1);
                     break;
                 }
             }
             #[cfg(feature = "rkyv")]
             {
                 if buf.len() >= 12 {
-                    let flags = u16::from_be_bytes([buf[6], buf[7]]);
+                    let flags = buf[1];
                     if (flags & FLAG_RKYV) != 0 && (flags & FLAG_LZ4) == 0 {
-                        match decode_record_archived_from_slice(&buf[..]) {
+                        match decode_record_archived_trusted_from_slice(&buf[..]) {
                             Ok((arec, consumed)) => {
-                                if let Some(js) = &json {
-                                    let evt = json_event_from_archived_record(arec);
-                                    if !js.try_send(evt) {
-                                        counter!("ultra_json_dropped_total").increment(1);
-                                    }
-                                }
-                                #[cfg(feature = "kafka")]
-                                if let Some(k) = &ks {
-                                    // Deserialize only for Kafka sink (selective conversion)
-                                    let mut map = SharedDeserializeMap::new();
-                                    match arec.deserialize(&mut map) {
-                                        Ok(rec) => k.try_send(rec),
-                                        Err(_) => {
-                                            counter!("ultra_kafka_deser_errors_total").increment(1);
+                                // Convert to owned Record for output stage
+                                let mut map = SharedDeserializeMap::new();
+                                match arec.deserialize(&mut map) {
+                                    Ok(rec) => {
+                                        if out.try_send(rec).is_err() {
+                                            counter!("ultra_output_queue_dropped_total").increment(1);
+                                        }
+                                        let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
+                                        if (v & INGEST_SAMPLE_MASK) == 0 {
+                                            counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
                                         }
                                     }
-                                }
-                                let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
-                                if (v & INGEST_SAMPLE_MASK) == 0 {
-                                    counter!("ultra_records_ingested_total")
-                                        .increment(INGEST_SAMPLE_WEIGHT);
+                                    Err(_) => {
+                                        counter!("ultra_rkyv_deser_errors_total").increment(1);
+                                    }
                                 }
                                 buf.advance(consumed);
                                 continue;
@@ -656,19 +712,12 @@ async fn handle_client(
             match decode_record_from_slice(&buf[..], &mut scratch) {
                 Ok(rec_and_len) => {
                     let (rec, consumed) = rec_and_len;
-                    if let Some(js) = &json {
-                        let evt = json_event_owned_from_record(&rec);
-                        if !js.try_send(evt) {
-                            counter!("ultra_json_dropped_total").increment(1);
-                        }
-                    }
                     let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
                     if (v & INGEST_SAMPLE_MASK) == 0 {
                         counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
                     }
-                    #[cfg(feature = "kafka")]
-                    if let Some(k) = &ks {
-                        k.try_send(rec);
+                    if out.try_send(rec).is_err() {
+                        counter!("ultra_output_queue_dropped_total").increment(1);
                     }
                     buf.advance(consumed);
                 }
@@ -676,15 +725,8 @@ async fn handle_client(
                     counter!("ultra_decode_bad_header_total").increment(1);
                     counter!("ultra_resync_events_total").increment(1);
                     RESYNC_EVENTS_THIS_MINUTE.fetch_add(1, Ordering::Relaxed);
-                    // scan for next magic to resync
-                    let magic = faststreams::FRAME_MAGIC.to_be_bytes();
-                    if let Some(idx) = memchr::memmem::find(&buf[..], &magic) {
-                        if idx > 0 {
-                            buf.advance(idx);
-                        }
-                    } else {
-                        buf.clear();
-                    }
+                    // Without a magic marker, drop one byte to attempt resync
+                    buf.advance(1);
                     break;
                 }
                 Err(faststreams::StreamError::De(_)) => {

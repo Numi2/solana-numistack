@@ -1,14 +1,15 @@
-// Numan Thabit 2019
-//! QUIC transport plumbing for the JSON-RPC server.
+// Numan Thabit 201337
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use quinn::{Connection, Endpoint, ReadExactError, ServerConfig, TransportConfig, VarInt};
+use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::{CertificateParams, DistinguishedName, DnType, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::value::RawValue;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument};
@@ -176,13 +177,16 @@ async fn handle_stream(
 
         buffers.read_payload(recv, len).await?;
 
+        let request: JsonRpcRequest<'_> = simd_json::from_slice(buffers.payload.as_mut_slice())?;
         let JsonRpcRequest {
-            _jsonrpc: _,
             id,
             method,
             params,
-        } = simd_json::from_slice(buffers.payload.as_mut_slice())?;
-        let response = match router.handle(&method, &params).await {
+            ..
+        } = request;
+        // Only idempotent read-only methods are supported; future mutating methods should be
+        // rejected on early-data paths.
+        let response = match router.handle(method, params).await {
             Ok(result) => JsonRpcMessage::success(id, result),
             Err(err) => JsonRpcMessage::error(id, err),
         };
@@ -203,6 +207,7 @@ async fn handle_stream(
 }
 
 fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
+    // Self-signed cert for embedded server (sufficient for QUIC RPC in trusted networks).
     let mut params = CertificateParams::new(vec![]);
     params.distinguished_name = DistinguishedName::new();
     params
@@ -214,7 +219,17 @@ fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
     let cert = rcgen::Certificate::from_params(params)?;
     let key = PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
     let cert_der: CertificateDer<'static> = CertificateDer::from(cert.serialize_der()?);
-    let mut server_config = ServerConfig::with_single_cert(vec![cert_der], key)?;
+
+    // Build rustls server config to set ALPN and (implicitly) allow safe 0-RTT reads.
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key)?;
+    tls_config.alpn_protocols = vec![b"jsonrpc-quic".to_vec()];
+
+    // Convert to Quinn server config with custom transport.
+    let mut server_config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
+        tls_config,
+    )?));
     let mut transport = TransportConfig::default();
     transport.max_concurrent_bidi_streams(VarInt::from_u32(max_streams));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(3)));
@@ -223,77 +238,76 @@ fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
 }
 
 #[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
+struct JsonRpcRequest<'a> {
     #[serde(default = "default_jsonrpc")]
-    _jsonrpc: String,
-    id: Value,
-    method: String,
+    _jsonrpc: &'a str,
     #[serde(default)]
-    params: Value,
+    #[serde(borrow)]
+    id: Option<&'a RawValue>,
+    #[serde(borrow)]
+    method: &'a str,
+    #[serde(default)]
+    #[serde(borrow)]
+    params: Option<&'a RawValue>,
 }
 
-#[derive(Serialize)]
-struct JsonRpcSuccess<T>
+enum JsonRpcMessage<'a, T>
 where
     T: Serialize,
 {
-    jsonrpc: &'static str,
-    id: Value,
-    result: T,
+    Success {
+        id: Option<&'a RawValue>,
+        result: T,
+    },
+    Error {
+        id: Option<&'a RawValue>,
+        error: RpcCallError,
+    },
 }
 
-impl<T> JsonRpcSuccess<T>
+impl<'a, T> JsonRpcMessage<'a, T>
 where
     T: Serialize,
 {
-    fn new(id: Value, result: T) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            id,
-            result,
+    fn success(id: Option<&'a RawValue>, result: T) -> Self {
+        Self::Success { id, result }
+    }
+
+    fn error(id: Option<&'a RawValue>, error: RpcCallError) -> Self {
+        Self::Error { id, error }
+    }
+}
+
+impl<'a, T> Serialize for JsonRpcMessage<'a, T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("JsonRpcResponse", 3)?;
+        state.serialize_field("jsonrpc", "2.0")?;
+        match self {
+            JsonRpcMessage::Success { id, result } => {
+                match id {
+                    Some(raw) => state.serialize_field("id", raw)?,
+                    None => state.serialize_field("id", &())?,
+                }
+                state.serialize_field("result", result)?;
+            }
+            JsonRpcMessage::Error { id, error } => {
+                match id {
+                    Some(raw) => state.serialize_field("id", raw)?,
+                    None => state.serialize_field("id", &())?,
+                }
+                state.serialize_field("error", error)?;
+            }
         }
+        state.end()
     }
 }
 
-#[derive(Serialize)]
-struct JsonRpcErrorResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    error: Value,
-}
-
-impl JsonRpcErrorResponse {
-    fn new(id: Value, err: RpcCallError) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            id,
-            error: err.into_error_object(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-enum JsonRpcMessage<T>
-where
-    T: Serialize,
-{
-    Success(JsonRpcSuccess<T>),
-    Error(JsonRpcErrorResponse),
-}
-
-impl<T> JsonRpcMessage<T>
-where
-    T: Serialize,
-{
-    fn success(id: Value, result: T) -> Self {
-        Self::Success(JsonRpcSuccess::new(id, result))
-    }
-
-    fn error(id: Value, err: RpcCallError) -> Self {
-        Self::Error(JsonRpcErrorResponse::new(id, err))
-    }
-}
-
-fn default_jsonrpc() -> String {
-    "2.0".to_string()
+fn default_jsonrpc() -> &'static str {
+    "2.0"
 }

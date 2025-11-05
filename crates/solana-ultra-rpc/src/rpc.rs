@@ -9,8 +9,10 @@ use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use base64::Engine as _;
-use serde::{ser::SerializeTuple, ser::Serializer, Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeStruct, SerializeTuple, Serializer};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::cache::{AccountCache, AccountRecord};
@@ -18,6 +20,7 @@ use crate::telemetry::RpcMetrics;
 
 /// Tracks most recent root slot applied by the ingest pipeline.
 #[derive(Default)]
+#[repr(align(64))]
 pub struct SlotTracker {
     current: AtomicU64,
 }
@@ -57,7 +60,11 @@ impl RpcRouter {
     }
 
     /// Dispatch a request and return either a JSON result or an RPC error object.
-    pub async fn handle(&self, method: &str, params: &Value) -> Result<RpcResult, RpcCallError> {
+    pub async fn handle(
+        &self,
+        method: &str,
+        params: Option<&RawValue>,
+    ) -> Result<RpcResult, RpcCallError> {
         match method {
             "getAccountInfo" => self.get_account_info(params).await,
             "getMultipleAccounts" => self.get_multiple_accounts(params).await,
@@ -77,7 +84,10 @@ impl RpcRouter {
         }
     }
 
-    async fn get_account_info(&self, params: &Value) -> Result<RpcResult, RpcCallError> {
+    async fn get_account_info(
+        &self,
+        params: Option<&RawValue>,
+    ) -> Result<RpcResult, RpcCallError> {
         let start = Instant::now();
         let (pubkey, cfg) = match parse_account_params(params) {
             Ok(v) => v,
@@ -89,7 +99,7 @@ impl RpcRouter {
         };
 
         // Validate supported config
-        if let Some(enc) = &cfg.encoding {
+        if let Some(enc) = cfg.encoding {
             if enc != "base64" {
                 self.metrics
                     .record_request("getAccountInfo", start.elapsed().as_secs_f64(), 0);
@@ -98,8 +108,8 @@ impl RpcRouter {
                 ));
             }
         }
-        if let Some(commitment) = &cfg.commitment {
-            match commitment.as_str() {
+        if let Some(commitment) = cfg.commitment {
+            match commitment {
                 "processed" | "confirmed" | "finalized" => {}
                 _ => {
                     self.metrics
@@ -138,7 +148,10 @@ impl RpcRouter {
         Ok(RpcResult::AccountInfo(response))
     }
 
-    async fn get_multiple_accounts(&self, params: &Value) -> Result<RpcResult, RpcCallError> {
+    async fn get_multiple_accounts(
+        &self,
+        params: Option<&RawValue>,
+    ) -> Result<RpcResult, RpcCallError> {
         let start = Instant::now();
         let (pubkeys, cfg) = match parse_multiple_account_params(params) {
             Ok(v) => v,
@@ -153,7 +166,7 @@ impl RpcRouter {
         };
 
         // Validate supported config
-        if let Some(enc) = &cfg.encoding {
+        if let Some(enc) = cfg.encoding {
             if enc != "base64" {
                 self.metrics.record_request(
                     "getMultipleAccounts",
@@ -165,8 +178,8 @@ impl RpcRouter {
                 ));
             }
         }
-        if let Some(commitment) = &cfg.commitment {
-            match commitment.as_str() {
+        if let Some(commitment) = cfg.commitment {
+            match commitment {
                 "processed" | "confirmed" | "finalized" => {}
                 _ => {
                     self.metrics.record_request(
@@ -193,28 +206,62 @@ impl RpcRouter {
             }
         }
 
-        // Conservative per-key lookups to avoid coupling to shard math in this layer,
-        // with a fast path when no dataSlice is requested.
-        let mut total_bytes = 0usize;
-        let mut results = Vec::with_capacity(pubkeys.len());
+        // Group lookups by shard to maximise locality and prefetch shard maps.
+        let snapshot = self.cache.snapshot();
+        let shard_mask = self.cache.shard_mask();
+        let shard_count = snapshot.len();
+        let mut buckets: Vec<Vec<(usize, solana_sdk::pubkey::Pubkey)>> =
+            (0..shard_count).map(|_| Vec::new()).collect();
+        for (idx, key) in pubkeys.iter().cloned().enumerate() {
+            let shard_idx = (key.to_bytes()[0] as usize) & shard_mask;
+            buckets[shard_idx].push((idx, key));
+        }
+
+        // Prepare result slots preserving original order.
+        let mut results: Vec<Option<AccountInfoValue>> = vec![None; pubkeys.len()];
+
+        // Prefetch shard maps we are about to touch (x86_64 best-effort).
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            for (shard_idx, bucket) in buckets.iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                let ptr = (&*snapshot[shard_idx]) as *const _ as *const i8;
+                unsafe { _mm_prefetch(ptr, _MM_HINT_T0) };
+            }
+        }
+
         if let Some(slice) = cfg.data_slice.as_ref() {
-            for key in pubkeys {
-                let entry = self
-                    .cache
-                    .get(&key)
-                    .map(|record| account_to_response_with_slice(record.as_ref(), Some(slice)));
-                total_bytes += entry.as_ref().map(data_size).unwrap_or(0);
-                results.push(entry);
+            for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                let shard = &snapshot[shard_idx];
+                for (res_idx, key) in bucket {
+                    if let Some(record) = shard.get(&key) {
+                        results[res_idx] = Some(account_to_response_with_slice(record.as_ref(), Some(slice)));
+                    }
+                }
             }
         } else {
-            for key in pubkeys {
-                let entry = self
-                    .cache
-                    .get(&key)
-                    .map(|record| account_to_response(record.as_ref()));
-                total_bytes += entry.as_ref().map(data_size).unwrap_or(0);
-                results.push(entry);
+            for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                let shard = &snapshot[shard_idx];
+                for (res_idx, key) in bucket {
+                    if let Some(record) = shard.get(&key) {
+                        results[res_idx] = Some(account_to_response(record.as_ref()));
+                    }
+                }
             }
+        }
+
+        let mut total_bytes = 0usize;
+        for entry in results.iter().flatten() {
+            total_bytes += data_size(entry);
         }
         self.metrics.record_request(
             "getMultipleAccounts",
@@ -249,51 +296,28 @@ impl Serialize for RpcResult {
     }
 }
 
-fn parse_account_params(params: &Value) -> Result<(Pubkey, AccountConfig), RpcCallError> {
-    let arr = params
-        .as_array()
-        .ok_or_else(|| RpcCallError::invalid_params("expected params array"))?;
-    let pubkey_str = arr
-        .first()
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcCallError::invalid_params("missing pubkey"))?;
-    let pubkey =
-        Pubkey::from_str(pubkey_str).map_err(|_| RpcCallError::invalid_params("invalid pubkey"))?;
-    let cfg = arr
-        .get(1)
-        .cloned()
-        .map(|value| serde_json::from_value(value).unwrap_or_default())
-        .unwrap_or_default();
-    Ok((pubkey, cfg))
+fn parse_account_params<'a>(
+    params: Option<&'a RawValue>,
+) -> Result<(Pubkey, AccountConfig<'a>), RpcCallError> {
+    let raw = params.map(|value| value.get()).unwrap_or("[]");
+    let parsed: AccountParams<'a> = serde_json::from_str(raw)?;
+    let pubkey = Pubkey::from_str(parsed.pubkey)
+        .map_err(|_| RpcCallError::invalid_params("invalid pubkey"))?;
+    Ok((pubkey, parsed.config))
 }
 
-fn parse_multiple_account_params(
-    params: &Value,
-) -> Result<(Vec<Pubkey>, MultipleAccountConfig), RpcCallError> {
-    let arr = params
-        .as_array()
-        .ok_or_else(|| RpcCallError::invalid_params("expected params array"))?;
-    let keys_value = arr
-        .first()
-        .ok_or_else(|| RpcCallError::invalid_params("missing pubkeys"))?;
-    let keys_array = keys_value
-        .as_array()
-        .ok_or_else(|| RpcCallError::invalid_params("pubkeys must be array"))?;
-    let mut pubkeys = Vec::with_capacity(keys_array.len());
-    for value in keys_array {
-        let key = value
-            .as_str()
-            .ok_or_else(|| RpcCallError::invalid_params("pubkey must be base58 string"))?;
+fn parse_multiple_account_params<'a>(
+    params: Option<&'a RawValue>,
+) -> Result<(Vec<Pubkey>, MultipleAccountConfig<'a>), RpcCallError> {
+    let raw = params.map(|value| value.get()).unwrap_or("[]");
+    let parsed: MultipleAccountParams<'a> = serde_json::from_str(raw)?;
+    let mut pubkeys = Vec::with_capacity(parsed.pubkeys.len());
+    for key in parsed.pubkeys {
         let pubkey =
             Pubkey::from_str(key).map_err(|_| RpcCallError::invalid_params("invalid pubkey"))?;
         pubkeys.push(pubkey);
     }
-    let cfg = arr
-        .get(1)
-        .cloned()
-        .map(|value| serde_json::from_value(value).unwrap_or_default())
-        .unwrap_or_default();
-    Ok((pubkeys, cfg))
+    Ok((pubkeys, parsed.config))
 }
 
 fn data_size(info: &AccountInfoValue) -> usize {
@@ -325,31 +349,115 @@ fn account_to_response_with_slice(
 }
 
 #[derive(Deserialize, Default)]
-struct AccountConfig {
+struct AccountConfig<'a> {
     #[allow(dead_code)]
-    encoding: Option<String>,
+    #[serde(default)]
+    #[serde(borrow)]
+    encoding: Option<&'a str>,
     #[serde(rename = "minContextSlot")]
     #[allow(dead_code)]
     min_context_slot: Option<u64>,
     #[allow(dead_code)]
-    commitment: Option<String>,
+    #[serde(default)]
+    #[serde(borrow)]
+    commitment: Option<&'a str>,
     #[serde(rename = "dataSlice")]
     #[allow(dead_code)]
     data_slice: Option<DataSliceConfig>,
 }
 
 #[derive(Deserialize, Default)]
-struct MultipleAccountConfig {
+struct MultipleAccountConfig<'a> {
     #[allow(dead_code)]
-    encoding: Option<String>,
+    #[serde(default)]
+    #[serde(borrow)]
+    encoding: Option<&'a str>,
     #[serde(rename = "minContextSlot")]
     #[allow(dead_code)]
     min_context_slot: Option<u64>,
     #[allow(dead_code)]
-    commitment: Option<String>,
+    #[serde(default)]
+    #[serde(borrow)]
+    commitment: Option<&'a str>,
     #[serde(rename = "dataSlice")]
     #[allow(dead_code)]
     data_slice: Option<DataSliceConfig>,
+}
+
+struct AccountParams<'a> {
+    pubkey: &'a str,
+    config: AccountConfig<'a>,
+}
+
+impl<'de> Deserialize<'de> for AccountParams<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AccountParamsVisitor;
+
+        impl<'de> Visitor<'de> for AccountParamsVisitor {
+            type Value = AccountParams<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("array [pubkey, config?]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let pubkey: &'de str = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let config: Option<AccountConfig<'de>> = seq.next_element()?;
+                Ok(AccountParams {
+                    pubkey,
+                    config: config.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(AccountParamsVisitor)
+    }
+}
+
+struct MultipleAccountParams<'a> {
+    pubkeys: Vec<&'a str>,
+    config: MultipleAccountConfig<'a>,
+}
+
+impl<'de> Deserialize<'de> for MultipleAccountParams<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MultipleAccountParamsVisitor;
+
+        impl<'de> Visitor<'de> for MultipleAccountParamsVisitor {
+            type Value = MultipleAccountParams<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("array [pubkeys, config?]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let pubkeys: Vec<&'de str> = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let config: Option<MultipleAccountConfig<'de>> = seq.next_element()?;
+                Ok(MultipleAccountParams {
+                    pubkeys,
+                    config: config.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(MultipleAccountParamsVisitor)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -606,7 +714,7 @@ impl<T> RpcResponse<T> {
 pub struct RpcCallError {
     code: i32,
     message: String,
-    data: Option<Value>,
+    data: Option<RpcErrorData>,
 }
 
 impl RpcCallError {
@@ -630,17 +738,51 @@ impl RpcCallError {
         Self {
             code: -32016,
             message: "minimum context slot not reached".into(),
-            data: Some(json!({ "required": required, "observed": observed })),
+            data: Some(RpcErrorData::MinContext { required, observed }),
         }
     }
+}
 
-    /// Convert into JSON-RPC error object.
-    pub fn into_error_object(self) -> Value {
-        json!({
-            "code": self.code,
-            "message": self.message,
-            "data": self.data,
-        })
+impl Serialize for RpcCallError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = if self.data.is_some() { 3 } else { 2 };
+        let mut state = serializer.serialize_struct("RpcCallError", field_count)?;
+        state.serialize_field("code", &self.code)?;
+        state.serialize_field("message", &self.message)?;
+        if let Some(data) = &self.data {
+            state.serialize_field("data", data)?;
+        }
+        state.end()
+    }
+}
+
+#[derive(Debug)]
+enum RpcErrorData {
+    MinContext { required: u64, observed: u64 },
+    Details(String),
+}
+
+impl Serialize for RpcErrorData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            RpcErrorData::MinContext { required, observed } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("required", required)?;
+                map.serialize_entry("observed", observed)?;
+                map.end()
+            }
+            RpcErrorData::Details(details) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("details", details)?;
+                map.end()
+            }
+        }
     }
 }
 
@@ -649,7 +791,7 @@ impl From<serde_json::Error> for RpcCallError {
         Self {
             code: -32602,
             message: "invalid params".into(),
-            data: Some(json!({"details": err.to_string()})),
+            data: Some(RpcErrorData::Details(err.to_string())),
         }
     }
 }

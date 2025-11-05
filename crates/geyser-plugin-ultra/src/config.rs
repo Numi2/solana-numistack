@@ -62,6 +62,12 @@ pub struct Config {
     pub write_spin_cap_us: u64,
     #[serde(default = "default_write_sleep_backoff_us")]
     pub write_sleep_backoff_us: u64,
+    /// If true (Linux only), use SOCK_SEQPACKET + sendmmsg for UDS writes
+    #[serde(default = "default_use_seqpacket")]
+    pub use_seqpacket: bool,
+    /// If true (Linux only), call mlockall(MCL_CURRENT|MCL_FUTURE) and prefault buffers
+    #[serde(default)]
+    pub lock_memory: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -125,6 +131,17 @@ fn default_write_sleep_backoff_us() -> u64 {
     750
 }
 
+fn default_use_seqpacket() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
     pub socket_path: PathBuf,
@@ -149,6 +166,10 @@ pub struct ValidatedConfig {
     pub shed_throttle_ms: u64,
     pub write_spin_cap_us: u64,
     pub write_sleep_backoff_us: u64,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub use_seqpacket: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub lock_memory: bool,
 }
 
 impl Config {
@@ -221,16 +242,19 @@ impl Config {
         }
         let pool_default_cap = std::cmp::min(batch_bytes_max, ONE_MIB);
 
-        // optional memory budget
+        // optional memory budget (account for per-shard pools)
         if let Some(budget) = self.memory_budget_bytes {
-            let ceiling = pool_items_max.saturating_mul(pool_default_cap);
+            let ceiling = pool_items_max
+                .saturating_mul(pool_default_cap)
+                .saturating_mul(self.writer_threads.max(1));
             if ceiling > budget {
                 return Err(anyhow!(
-                    "memory ceiling {} exceeds memory_budget_bytes {} (items={} * cap={})",
+                    "memory ceiling {} exceeds memory_budget_bytes {} (items={} * cap={} * shards={})",
                     ceiling,
                     budget,
                     pool_items_max,
-                    pool_default_cap
+                    pool_default_cap,
+                    self.writer_threads.max(1)
                 ));
             }
         }
@@ -243,6 +267,16 @@ impl Config {
                 log::warn!("pin_core/rt_priority/sched_policy are ignored on non-Linux platforms");
                 let _ = (&self.pin_core, &self.rt_priority, &self.sched_policy);
             }
+        }
+
+        // On non-Linux, force these features off
+        #[cfg(not(target_os = "linux"))]
+        if self.use_seqpacket {
+            log::warn!("use_seqpacket is ignored on non-Linux platforms");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if self.lock_memory {
+            log::warn!("lock_memory is ignored on non-Linux platforms");
         }
 
         Ok(ValidatedConfig {
@@ -268,6 +302,26 @@ impl Config {
             shed_throttle_ms: self.shed_throttle_ms,
             write_spin_cap_us: self.write_spin_cap_us,
             write_sleep_backoff_us: self.write_sleep_backoff_us,
+            use_seqpacket: {
+                #[cfg(target_os = "linux")]
+                {
+                    self.use_seqpacket
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    false
+                }
+            },
+            lock_memory: {
+                #[cfg(target_os = "linux")]
+                {
+                    self.lock_memory
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    false
+                }
+            },
         })
     }
 }

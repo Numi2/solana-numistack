@@ -27,6 +27,152 @@ impl<T> Clone for AdaptiveBatcher<T> {
     }
 }
 
+/// Byte/time-aware batcher: coalesces items until hitting either item-count, byte-size,
+/// short delay, or a strict max batch age to cap tail latency.
+pub struct ByteTimedBatcher<T, F>
+where
+    F: Fn(&T) -> usize + Send + Sync + 'static,
+{
+    queue: Arc<ArrayQueue<T>>,
+    notify: Arc<Notify>,
+    max_items: usize,
+    max_bytes: usize,
+    max_delay: Duration,
+    max_age: Duration,
+    sizer: F,
+}
+
+impl<T, F> Clone for ByteTimedBatcher<T, F>
+where
+    F: Fn(&T) -> usize + Send + Sync + Clone + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            notify: self.notify.clone(),
+            max_items: self.max_items,
+            max_bytes: self.max_bytes,
+            max_delay: self.max_delay,
+            max_age: self.max_age,
+            sizer: self.sizer.clone(),
+        }
+    }
+}
+
+impl<T, F> ByteTimedBatcher<T, F>
+where
+    F: Fn(&T) -> usize + Send + Sync + 'static,
+{
+    /// Create a new byte/time-aware batcher.
+    pub fn new(
+        queue_depth: usize,
+        max_items: usize,
+        max_bytes: usize,
+        max_delay: Duration,
+        max_age: Duration,
+        sizer: F,
+    ) -> Self {
+        Self {
+            queue: Arc::new(ArrayQueue::new(queue_depth)),
+            notify: Arc::new(Notify::new()),
+            max_items,
+            max_bytes,
+            max_delay,
+            max_age,
+            sizer,
+        }
+    }
+
+    /// Attempt to enqueue a new item. Returns the item back if the queue is full.
+    pub fn enqueue(&self, item: T) -> Result<(), T> {
+        match self.queue.push(item) {
+            Ok(_) => {
+                self.notify.notify_one();
+                Ok(())
+            }
+            Err(item) => Err(item),
+        }
+    }
+
+    /// Wait for the next batch, bounded by item count, byte size and deadlines.
+    pub async fn next_batch(&self) -> Vec<T> {
+        let mut soft_deadline = Instant::now() + self.max_delay;
+        let mut batch: Vec<T> = Vec::with_capacity(self.max_items);
+        let mut total_bytes: usize = 0;
+        let mut age_deadline: Option<Instant> = None;
+
+        loop {
+            // Fill up to limits if items are available.
+            while batch.len() < self.max_items && total_bytes < self.max_bytes {
+                if let Some(item) = self.queue.pop() {
+                    if age_deadline.is_none() {
+                        age_deadline = Some(Instant::now() + self.max_age);
+                    }
+                    total_bytes = total_bytes.saturating_add((self.sizer)(&item));
+                    batch.push(item);
+                    if batch.len() >= self.max_items || total_bytes >= self.max_bytes {
+                        return batch;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if !batch.is_empty() {
+                // We've started a batch: flush on notify (to add more) or on earliest deadline.
+                let notified = self.notify.notified();
+                let next_deadline = age_deadline
+                    .map(|age| if age < soft_deadline { age } else { soft_deadline })
+                    .unwrap_or(soft_deadline);
+                tokio::select! {
+                    _ = notified => {
+                        // Give a short window for more items, but cap by max_age.
+                        soft_deadline = Instant::now() + self.max_delay;
+                        continue;
+                    }
+                    _ = time::sleep_until(next_deadline) => {
+                        return batch;
+                    }
+                }
+            } else {
+                // No items yet: wait until something arrives or the soft delay expires.
+                let notified = self.notify.notified();
+                tokio::select! {
+                    _ = notified => {
+                        soft_deadline = Instant::now() + self.max_delay;
+                        continue;
+                    }
+                    _ = time::sleep_until(soft_deadline) => {
+                        if let Some(item) = self.queue.pop() {
+                            age_deadline = Some(Instant::now() + self.max_age);
+                            total_bytes = (self.sizer)(&item);
+                            batch.push(item);
+                            continue;
+                        } else {
+                            soft_deadline = Instant::now() + self.max_delay;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Current length of the queue for metrics purposes.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Returns true when the queue holds no pending items.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Remaining capacity in the queue.
+    pub fn remaining_capacity(&self) -> usize {
+        self.queue.capacity() - self.queue.len()
+    }
+}
+
 impl<T> AdaptiveBatcher<T> {
     /// Create a new batcher with the provided queue depth, batch size and deadline.
     pub fn new(queue_depth: usize, max_batch_size: usize, max_delay: Duration) -> Self {

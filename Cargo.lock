@@ -6902,6 +6902,7 @@ dependencies = [
  "event-listener",
  "faststreams",
  "futures",
+ "memmap2",
  "metrics",
  "metrics-exporter-prometheus",
  "socket2 0.5.10",

@@ -35,7 +35,10 @@ const FRAME_HEADER_TEMPLATE: [u8; 12] = [
 // Exponentially weighted moving average for recent payload lengths
 static AVG_LEN: AtomicUsize = AtomicUsize::new(512);
 
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUpdate {
@@ -50,7 +53,10 @@ pub struct AccountUpdate {
     pub data: Vec<u8>,
 }
 
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxUpdate {
@@ -61,7 +67,10 @@ pub struct TxUpdate {
     pub vote: bool,
 }
 
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockMeta {
@@ -75,7 +84,10 @@ pub struct BlockMeta {
     pub leader: Option<[u8; 32]>,
 }
 
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
@@ -108,7 +120,6 @@ pub struct AccountUpdateRef<'a> {
 pub enum RecordRef<'a> {
     Account(AccountUpdateRef<'a>),
 }
-
 
 #[derive(thiserror::Error, Debug)]
 pub enum StreamError {
@@ -205,7 +216,11 @@ pub fn encode_into_with(
     encode_value_into(rec, buf, opts)
 }
 
-fn encode_value_into<T: Serialize>(val: &T, buf: &mut Vec<u8>, opts: EncodeOptions) -> Result<(), StreamError> {
+fn encode_value_into<T: Serialize>(
+    val: &T,
+    buf: &mut Vec<u8>,
+    opts: EncodeOptions,
+) -> Result<(), StreamError> {
     let bincode_opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes();
@@ -266,9 +281,8 @@ pub fn decode_record_archived_from_slice<'a>(
         return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
     }
     let body = &src[12..total];
-    let rec = rkyv::check_archived_root::<Record>(body).map_err(|e| {
-        StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-    })?;
+    let rec = rkyv::check_archived_root::<Record>(body)
+        .map_err(|e| StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
     Ok((rec, total))
 }
 
@@ -429,4 +443,192 @@ pub fn write_all_vectored_slices(
     Ok(())
 }
 
-// (intentionally left empty)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Write};
+    use std::sync::atomic::Ordering;
+
+    fn sample_account(slot: u64) -> Record {
+        Record::Account(AccountUpdate {
+            slot,
+            is_startup: slot == 0,
+            pubkey: [1u8; 32],
+            lamports: 42,
+            owner: [2u8; 32],
+            executable: false,
+            rent_epoch: 5,
+            data: vec![3u8; 16],
+        })
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_default_opts() {
+        let record = sample_account(123);
+        let encoded = encode_record(&record).expect("encode succeeds");
+        let mut cursor = io::Cursor::new(encoded);
+        let decoded = decode_record(&mut cursor).expect("decode succeeds");
+        match decoded {
+            Record::Account(acc) => {
+                assert_eq!(acc.slot, 123);
+                assert!(!acc.is_startup);
+                assert_eq!(acc.pubkey, [1u8; 32]);
+                assert_eq!(acc.owner, [2u8; 32]);
+                assert_eq!(acc.data, vec![3u8; 16]);
+            }
+            other => panic!("unexpected record variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_sets_lz4_flag_when_threshold_exceeded() {
+        // Prepare a payload that will certainly exceed 512 bytes when serialized.
+        let record = Record::Block(BlockMeta {
+            slot: 99,
+            blockhash: Some([9u8; 32]),
+            parent_slot: Some(88),
+            rewards_len: 1024,
+            block_time_unix: Some(123456789),
+            leader: Some([7u8; 32]),
+        });
+        let opts = EncodeOptions {
+            enable_compression: true,
+            compress_threshold: 1,
+            payload_hint: None,
+            format: PayloadFormat::Bincode,
+        };
+        let mut buf = Vec::new();
+        encode_into_with(&record, &mut buf, opts).expect("encode succeeds");
+        assert_eq!(&buf[..4], &FRAME_MAGIC.to_be_bytes());
+        assert_eq!(&buf[4..6], &FRAME_VERSION.to_be_bytes());
+        let flags = u16::from_be_bytes([buf[6], buf[7]]);
+        assert_eq!(flags & FLAG_LZ4, FLAG_LZ4, "lz4 flag not set");
+
+        let mut cursor = io::Cursor::new(buf);
+        let decoded = decode_record(&mut cursor).expect("decode succeeds");
+        match decoded {
+            Record::Block(meta) => {
+                assert_eq!(meta.slot, 99);
+                assert_eq!(meta.rewards_len, 1024);
+                assert_eq!(meta.leader, Some([7u8; 32]));
+            }
+            other => panic!("unexpected record variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_from_slice_handles_compressed_payloads() {
+        let record = sample_account(777);
+        let opts = EncodeOptions {
+            enable_compression: true,
+            compress_threshold: 1,
+            payload_hint: None,
+            format: PayloadFormat::Bincode,
+        };
+        let encoded = encode_record_with(&record, opts).expect("encode succeeds");
+        let mut scratch = Vec::new();
+        let (decoded, consumed) =
+            decode_record_from_slice(&encoded, &mut scratch).expect("decode succeeds");
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            Record::Account(acc) => {
+                assert_eq!(acc.slot, 777);
+                assert!(!acc.is_startup);
+                assert_eq!(acc.data.len(), 16);
+            }
+            other => panic!("unexpected record variant: {other:?}"),
+        }
+        assert!(
+            scratch.len() >= 16,
+            "scratch buffer should retain decompressed payload"
+        );
+    }
+
+    #[test]
+    fn encode_record_ref_into_reuses_buffer_capacity() {
+        let mut buf = Vec::with_capacity(16);
+        let rec = RecordRef::Account(AccountUpdateRef {
+            slot: 1,
+            is_startup: false,
+            pubkey: [4u8; 32],
+            lamports: 55,
+            owner: [5u8; 32],
+            executable: true,
+            rent_epoch: 9,
+            data: &[1, 2, 3],
+        });
+        encode_record_ref_into_with(&rec, &mut buf, EncodeOptions::default_throughput())
+            .expect("encode succeeds");
+        let initial_capacity = buf.capacity();
+        assert!(initial_capacity >= buf.len());
+        encode_record_ref_into_with(&rec, &mut buf, EncodeOptions::default_throughput())
+            .expect("second encode succeeds");
+        assert_eq!(
+            buf.capacity(),
+            initial_capacity,
+            "buffer should reuse capacity"
+        );
+    }
+
+    struct ChunkedWriter {
+        chunk: usize,
+        body: Vec<u8>,
+    }
+
+    impl ChunkedWriter {
+        fn new(chunk: usize) -> Self {
+            Self {
+                chunk: chunk.max(1),
+                body: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for ChunkedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let take = buf.len().min(self.chunk);
+            self.body.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_all_vectored_handles_partial_writes() {
+        let frames = vec![
+            encode_record_with(&sample_account(1), EncodeOptions::default_throughput()).unwrap(),
+            encode_record_with(&sample_account(2), EncodeOptions::default_throughput()).unwrap(),
+        ];
+        let mut writer = ChunkedWriter::new(7);
+        write_all_vectored(&mut writer, &frames).expect("write succeeds");
+        let expected: Vec<u8> = frames.iter().flatten().copied().collect();
+        assert_eq!(writer.body, expected);
+    }
+
+    #[test]
+    fn write_all_vectored_slices_advances_offsets() {
+        let frames = vec![
+            encode_record_with(&sample_account(10), EncodeOptions::default_throughput()).unwrap(),
+            encode_record_with(&sample_account(11), EncodeOptions::default_throughput()).unwrap(),
+        ];
+        let expected: Vec<u8> = frames.iter().flatten().copied().collect();
+        let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
+        let mut writer = ChunkedWriter::new(5);
+        write_all_vectored_slices(&mut writer, &mut slices).expect("write succeeds");
+        assert_eq!(writer.body, expected);
+    }
+
+    #[test]
+    fn avg_len_updates_on_encode() {
+        super::AVG_LEN.store(64, Ordering::Relaxed);
+        let record = sample_account(42);
+        let mut buf = Vec::with_capacity(0);
+        encode_into_with(&record, &mut buf, EncodeOptions::default_throughput())
+            .expect("encode succeeds");
+        let observed = super::AVG_LEN.load(Ordering::Relaxed);
+        assert!(observed >= 64, "avg len should grow after encode");
+    }
+}

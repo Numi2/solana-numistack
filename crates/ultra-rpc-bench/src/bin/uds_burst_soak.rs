@@ -1,11 +1,17 @@
 use clap::Parser;
-use faststreams::{encode_record_with, write_all_vectored_slices, AccountUpdate, EncodeOptions, Record};
+use faststreams::{
+    encode_record_with, write_all_vectored_slices, AccountUpdate, EncodeOptions, Record,
+};
 use std::io::IoSlice;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "UDS burst/soak load generator for ultra aggregator")]
+#[command(
+    author,
+    version,
+    about = "UDS burst/soak load generator for ultra aggregator"
+)]
 struct Args {
     /// UDS path to aggregator
     #[arg(long, default_value = "/var/run/ultra-geyser.sock")]
@@ -54,12 +60,16 @@ fn gen_record(size: usize, slot: u64) -> Record {
 }
 
 fn percentile(sorted: &mut [f64], p: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let n = sorted.len() as f64;
     let rank = (p / 100.0) * (n - 1.0);
     let lo = rank.floor() as usize;
     let hi = rank.ceil() as usize;
-    if lo == hi { return sorted[lo]; }
+    if lo == hi {
+        return sorted[lo];
+    }
     let frac = rank - (lo as f64);
     sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
@@ -112,7 +122,9 @@ fn main() {
             bytes += frame.len();
             batch.push(frame);
             slot = slot.wrapping_add(1);
-            if bytes >= args.batch_bytes_max { break; }
+            if bytes >= args.batch_bytes_max {
+                break;
+            }
         }
 
         // Write the batch
@@ -138,8 +150,12 @@ fn main() {
         let p50 = percentile(&mut sorted, 50.0);
         let p99 = percentile(&mut sorted, 99.0);
         let p999 = percentile(&mut sorted, 99.9);
-        println!("batches={}, p50_ms={:.3}, p99_ms={:.3}, p99.9_ms={:.3}", sorted.len(), p50, p99, p999);
+        println!(
+            "batches={}, p50_ms={:.3}, p99_ms={:.3}, p99.9_ms={:.3}",
+            sorted.len(),
+            p50,
+            p99,
+            p999
+        );
     }
 }
-
-

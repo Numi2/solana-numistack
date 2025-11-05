@@ -118,8 +118,12 @@ fn default_shed_throttle_ms() -> u64 {
     500
 }
 
-fn default_write_spin_cap_us() -> u64 { 300 }
-fn default_write_sleep_backoff_us() -> u64 { 750 }
+fn default_write_spin_cap_us() -> u64 {
+    300
+}
+fn default_write_sleep_backoff_us() -> u64 {
+    750
+}
 
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {

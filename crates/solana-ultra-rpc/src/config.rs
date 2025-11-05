@@ -64,3 +64,64 @@ impl UltraRpcConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> UltraRpcConfig {
+        UltraRpcConfig::default()
+    }
+
+    #[test]
+    fn validate_accepts_default_config() {
+        base_config()
+            .validate()
+            .expect("default config should validate");
+    }
+
+    #[test]
+    fn validate_rejects_non_power_of_two_shards() {
+        let mut cfg = base_config();
+        cfg.shard_count = 3;
+        let err = cfg
+            .validate()
+            .expect_err("non power-of-two shard count must fail");
+        assert!(err.to_string().contains("shard_count"));
+    }
+
+    #[test]
+    fn validate_requires_queue_depth_covering_batches() {
+        let mut cfg = base_config();
+        cfg.max_batch_size = 512;
+        cfg.queue_depth = 128;
+        let err = cfg
+            .validate()
+            .expect_err("queue depth smaller than batch should fail");
+        assert!(err
+            .to_string()
+            .contains("queue depth should cover at least one batch"));
+    }
+
+    #[test]
+    fn validate_requires_nonzero_streams() {
+        let mut cfg = base_config();
+        cfg.max_streams = 0;
+        let err = cfg
+            .validate()
+            .expect_err("max_streams == 0 must fail validation");
+        assert!(err
+            .to_string()
+            .contains("must allow at least one concurrent stream"));
+    }
+
+    #[test]
+    fn validate_allows_customized_parameters() {
+        let mut cfg = base_config();
+        cfg.shard_count = 32;
+        cfg.max_batch_size = 64;
+        cfg.queue_depth = 4_096;
+        cfg.max_streams = 1_024;
+        cfg.validate().expect("custom config should validate");
+    }
+}

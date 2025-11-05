@@ -269,3 +269,115 @@ impl SnapshotSegment {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::account::{Account, AccountSharedData};
+    use solana_sdk::pubkey::Pubkey;
+
+    fn sample_account(data: &[u8]) -> AccountSharedData {
+        let owner = Pubkey::new_unique();
+        AccountSharedData::from(Account {
+            lamports: 1_000,
+            data: data.to_vec(),
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    #[test]
+    fn account_record_encodes_base64() {
+        let owner = Pubkey::new_unique();
+        let data = vec![1u8, 2, 3, 4];
+        let account = AccountSharedData::from(Account {
+            lamports: 99,
+            data: data.clone(),
+            owner,
+            executable: true,
+            rent_epoch: 7,
+        });
+        let record = AccountRecord::new(123, account.clone());
+        assert_eq!(record.slot(), 123);
+        assert_eq!(record.lamports(), 99);
+        assert_eq!(record.owner(), owner);
+        assert!(record.executable());
+        assert_eq!(record.rent_epoch(), 7);
+        assert_eq!(record.data_len(), data.len());
+        assert_eq!(record.data_slice(), data.as_slice());
+        let expected = base64::engine::general_purpose::STANDARD.encode(&data);
+        assert_eq!(record.data_base64().as_ref(), expected.as_str());
+    }
+
+    #[test]
+    fn account_cache_publish_and_get_roundtrip() {
+        let cache = AccountCache::new(8);
+        let pubkey = Pubkey::new_unique();
+        let account = sample_account(&[7u8; 5]);
+        let mut builder = AccountCacheBuilder::empty(cache.shard_count());
+        AccountUpdate {
+            pubkey,
+            data: Some(account.clone()),
+            slot: 42,
+        }
+        .apply(&mut builder);
+        cache.publish(builder);
+
+        let fetched = cache.get(&pubkey).expect("account present");
+        assert_eq!(fetched.slot(), 42);
+        assert_eq!(fetched.data_len(), 5);
+        assert_eq!(fetched.data_slice(), &[7u8; 5]);
+    }
+
+    #[test]
+    fn account_update_delete_removes_entry() {
+        let cache = AccountCache::new(4);
+        let pubkey = Pubkey::new_unique();
+        let account = sample_account(&[9u8; 3]);
+        let mut builder = AccountCacheBuilder::empty(cache.shard_count());
+        AccountUpdate {
+            pubkey,
+            data: Some(account),
+            slot: 1,
+        }
+        .apply(&mut builder);
+        cache.publish(builder);
+
+        let snapshot = cache.snapshot();
+        let mut builder = AccountCacheBuilder::from_snapshot(&snapshot, cache.shard_mask());
+        AccountUpdate {
+            pubkey,
+            data: None,
+            slot: 2,
+        }
+        .apply(&mut builder);
+        cache.publish(builder);
+
+        assert!(cache.get(&pubkey).is_none());
+    }
+
+    #[test]
+    fn snapshot_segment_hydrates_multiple_accounts() {
+        let cache = AccountCache::new(2);
+        let pubkey_a = Pubkey::new_unique();
+        let pubkey_b = Pubkey::new_unique();
+        let segment = SnapshotSegment {
+            base_slot: 77,
+            accounts: vec![
+                (pubkey_a, sample_account(&[1, 2, 3])),
+                (pubkey_b, sample_account(&[4, 5])),
+            ],
+        };
+        let mut builder = AccountCacheBuilder::empty(cache.shard_count());
+        segment.hydrate(&mut builder);
+        cache.publish(builder);
+
+        let rec_a = cache.get(&pubkey_a).expect("record a");
+        assert_eq!(rec_a.slot(), 77);
+        assert_eq!(rec_a.data_slice(), &[1, 2, 3]);
+        let rec_b = cache.get(&pubkey_b).expect("record b");
+        assert_eq!(rec_b.slot(), 77);
+        assert_eq!(rec_b.data_slice(), &[4, 5]);
+    }
+}

@@ -1052,3 +1052,62 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_base58_roundtrip() {
+        let input: [u8; 32] = [42u8; 32];
+        let encoded = bs58::encode(input).into_string();
+        let decoded = decode_base58(&encoded);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn decode_base58_invalid_returns_zeroes() {
+        let decoded = decode_base58("not-base58");
+        assert_eq!(decoded, [0u8; 32]);
+    }
+
+    #[test]
+    fn address_cache_caches_and_evicts() {
+        let mut cache = AddressCache::new(2);
+        let key_a = "11111111111111111111111111111112"; // bs58 for mostly zeros with trailing 2
+        let key_b = "11111111111111111111111111111113";
+        let key_c = "11111111111111111111111111111114";
+        let a = cache.decode_str(key_a);
+        let _b = cache.decode_str(key_b);
+        let a_cached = cache.decode_str(key_a);
+        assert_eq!(a, a_cached);
+        let _c = cache.decode_str(key_c);
+        // key_a should be evicted once capacity exceeded, causing re-decode
+        let a_new = cache.decode_str(key_a);
+        assert_eq!(a_new, a);
+    }
+
+    #[test]
+    fn buf_pool_recycles_large_buffers() {
+        let pool = std::sync::Arc::new(BufPool::new(2, 16));
+        let mut buf = pool.get();
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        pool.put(buf);
+        let reused = pool.get();
+        assert_eq!(reused.len(), 0);
+        assert!(reused.capacity() >= 16);
+    }
+
+    #[test]
+    fn frame_kind_detection_matches_variant() {
+        let record = Record::Slot {
+            slot: 1,
+            parent: Some(0),
+            status: 2,
+        };
+        let encoded = faststreams::encode_record(&record).expect("encode");
+        let mut scratch = Vec::new();
+        let kind = frame_kind_from_bytes(&encoded, &mut scratch);
+        assert_eq!(kind, "slot");
+    }
+}

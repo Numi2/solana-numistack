@@ -91,7 +91,8 @@ impl QuicRpcClient {
             let jitter = self.hedge_jitter;
             let second = async move {
                 tokio::time::sleep(jitter).await;
-                self.request_with_timeout(self.request_inner(&connection2, &payload2)).await
+                self.request_with_timeout(self.request_inner(&connection2, &payload2))
+                    .await
             };
             tokio::pin!(first);
             tokio::pin!(second);

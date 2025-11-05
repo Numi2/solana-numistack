@@ -1,5 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use faststreams::{decode_record_from_slice, encode_into_with, encode_record_with, EncodeOptions, Record};
+use faststreams::{
+    decode_record_from_slice, encode_into_with, encode_record_with, EncodeOptions, Record,
+};
 
 fn gen_account(len: usize) -> Record {
     let mut data = vec![0u8; len];
@@ -51,5 +53,3 @@ fn bench_encode_decode(c: &mut Criterion) {
 
 criterion_group!(benches, bench_encode_decode);
 criterion_main!(benches);
-
-

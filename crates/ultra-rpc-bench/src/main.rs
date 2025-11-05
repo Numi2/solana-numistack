@@ -796,3 +796,76 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_assignment_split() {
+        let (key, value) = parse_env_assignment("FOO=bar").expect("valid assignment");
+        assert_eq!(key, "FOO");
+        assert_eq!(value, "bar");
+    }
+
+    #[test]
+    fn parse_env_assignment_rejects_missing_value() {
+        let err = parse_env_assignment("BROKEN").expect_err("missing '=' should fail");
+        assert!(err.to_string().contains("missing '='"));
+    }
+
+    #[test]
+    fn split_numeric_unit_handles_decimals() {
+        let (value, unit) = split_numeric_unit("123.45ms").expect("valid pair");
+        assert!((value - 123.45).abs() < f64::EPSILON);
+        assert_eq!(unit, "ms");
+    }
+
+    #[test]
+    fn parse_latency_token_supports_micro() {
+        let micros = parse_latency_token("1.5ms").expect("parse token");
+        assert_eq!(micros, 1_500_000);
+        let micro_symbol = parse_latency_token("2µs").expect("micro symbol");
+        assert_eq!(micro_symbol, 2_000);
+    }
+
+    #[test]
+    fn parse_distribution_line_extracts_percentile() {
+        let pct = parse_distribution_line("  99.00%   123.4ms").expect("parse line");
+        assert_eq!(pct.percentile, 99.0);
+        assert_eq!(pct.latency_ns, 123_400_000);
+    }
+
+    #[test]
+    fn parse_wrk_output_collects_metrics() {
+        let output = r#"
+Running 1m test @ http://localhost
+  1 threads and 10 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.50ms    1.00ms  10.00ms   75.00%
+    Req/Sec     4.00k   500.00     5.50k    70.00%
+  Latency Distribution
+     50%    2.00ms
+     75%    3.00ms
+     99%    8.00ms
+
+  240000 requests in 60.00s, 18.00MB read
+Requests/sec:   4000.00
+Transfer/sec:     300.00KB
+"#;
+        let metrics = parse_wrk_output(output).expect("metrics parsed");
+        assert_eq!(metrics.requests_per_sec, Some(4000.0));
+        let latency = metrics.latency.as_ref().expect("latency stats");
+        assert_eq!(latency.avg_ns, 2_500_000);
+        let p99 = metrics.find_percentile(99.0).expect("p99 present");
+        assert_eq!(p99.latency_ns, 8_000_000);
+        let transfer = metrics.transfer_per_sec.expect("transfer");
+        assert_eq!(transfer.unit, "KB");
+    }
+
+    #[test]
+    fn wrk_metrics_is_empty_checks() {
+        let metrics = WrkMetrics::default();
+        assert!(metrics.is_empty());
+    }
+}

@@ -214,7 +214,8 @@ pub fn run_writer(
                                     }
                                 } else if cur_flush_after_ms < cfg.flush_after_ms {
                                     // restore slowly
-                                    cur_flush_after_ms = (cur_flush_after_ms + 1).min(cfg.flush_after_ms);
+                                    cur_flush_after_ms =
+                                        (cur_flush_after_ms + 1).min(cfg.flush_after_ms);
                                 }
                             }
 
@@ -233,7 +234,8 @@ pub fn run_writer(
                                 let mut block_start: Option<Instant> = None;
                                 let mut spun = false;
                                 loop {
-                                    match write_all_vectored_slices(&mut stream, ios.as_mut_slice()) {
+                                    match write_all_vectored_slices(&mut stream, ios.as_mut_slice())
+                                    {
                                         Ok(()) => {
                                             if let Some(start) = block_start.take() {
                                                 stall_ns += start.elapsed().as_nanos();
@@ -277,7 +279,8 @@ pub fn run_writer(
                                             error!(target = "ultra.writer", "write error: {e}");
                                             counter!("ultra_write_errors_total").increment(1);
                                             // attribute drops by batch size
-                                            counter!("ultra_write_error_drops_total").increment(send_batch.len() as u64);
+                                            counter!("ultra_write_error_drops_total")
+                                                .increment(send_batch.len() as u64);
                                             break;
                                         }
                                     }

@@ -776,3 +776,100 @@ fn shard_from_u64(value: u64, modulo: usize) -> usize {
     }
     shard_index(&value.to_le_bytes(), modulo)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{config, shard_from_u64, shard_index, DropPolicy, Streams, Ultra};
+    use std::{thread, time::Duration};
+    use tempfile::tempdir;
+
+    fn build_config(socket_path: String) -> config::Config {
+        config::Config {
+            socket_path,
+            queue_capacity: 4096,
+            queue_drop_policy: DropPolicy::DropNewest,
+            batch_max: 512,
+            batch_bytes_max: 64 * 1024,
+            flush_after_ms: 0,
+            write_timeout_ms: 200,
+            pin_core: None,
+            rt_priority: None,
+            sched_policy: None,
+            histogram_sample_log2: 8,
+            streams: Streams {
+                accounts: true,
+                transactions: true,
+                blocks: true,
+                slots: true,
+            },
+            metrics: None,
+            pool_items_max: Some(256),
+            memory_budget_bytes: Some(256 * 64 * 1024),
+            writer_threads: 4,
+            shed_throttle_ms: 25,
+            write_spin_cap_us: 300,
+            write_sleep_backoff_us: 750,
+        }
+    }
+
+    #[test]
+    fn config_validate_populates_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("ultra.sock");
+        let cfg = build_config(sock.to_string_lossy().to_string());
+        let validated = cfg.validate().expect("config should validate");
+        assert_eq!(validated.queue_capacity, 4096);
+        assert_eq!(validated.writer_threads, 4);
+        assert_eq!(validated.pool_items_max, 256);
+        assert_eq!(validated.pool_default_cap, 64 * 1024);
+        assert_eq!(validated.queue_drop_policy, DropPolicy::DropNewest);
+    }
+
+    #[test]
+    fn config_validate_rejects_relative_socket_path() {
+        let cfg = build_config("relative.sock".to_string());
+        let err = cfg.validate().expect_err("relative paths must fail");
+        assert!(err.to_string().contains("socket_path must be absolute"));
+    }
+
+    #[test]
+    fn config_validate_rejects_small_batch_bytes() {
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("ultra.sock");
+        let mut cfg = build_config(sock.to_string_lossy().to_string());
+        cfg.batch_bytes_max = 512; // below 1 KiB minimum
+        let err = cfg
+            .validate()
+            .expect_err("batch_bytes_max below minimum should fail");
+        assert!(err.to_string().contains("batch_bytes_max out of range"));
+    }
+
+    #[test]
+    fn shard_index_consistent_with_u64_variant() {
+        for modulo in [1usize, 2, 8, 16, 1024] {
+            for value in [0u64, 1, 42, u64::MAX - 1] {
+                let idx_from_u64 = shard_from_u64(value, modulo);
+                let idx_from_bytes = shard_index(&value.to_le_bytes(), modulo);
+                assert_eq!(idx_from_u64, idx_from_bytes);
+                assert!(idx_from_u64 < modulo.max(1));
+            }
+        }
+    }
+
+    #[test]
+    fn ultra_mark_shed_account_clears_after_ttl() {
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("ultra.sock");
+        let mut cfg = build_config(sock.to_string_lossy().to_string());
+        cfg.shed_throttle_ms = 1;
+        let validated = cfg.validate().expect("config should validate");
+
+        let mut ultra = Ultra::new();
+        ultra.cfg = Some(validated);
+        let key = [9u8; 32];
+        ultra.mark_shed_account(key);
+        assert!(ultra.is_account_shed(&key));
+        thread::sleep(Duration::from_millis(2));
+        assert!(!ultra.is_account_shed(&key));
+    }
+}

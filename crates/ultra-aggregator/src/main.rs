@@ -3,17 +3,17 @@
 #![forbid(unsafe_code)]
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
-use faststreams::{decode_record_from_slice, Record};
 #[cfg(feature = "rkyv")]
 use faststreams::{decode_record_archived_from_slice, ArchivedRecord, FLAG_LZ4, FLAG_RKYV};
+use faststreams::{decode_record_from_slice, Record};
+use metrics::{counter, gauge, histogram};
+use metrics_exporter_prometheus::PrometheusBuilder;
 #[cfg(feature = "rkyv")]
 use rkyv;
 #[cfg(all(feature = "rkyv", feature = "kafka"))]
 use rkyv::de::deserializers::SharedDeserializeMap;
 #[cfg(all(feature = "rkyv", feature = "kafka"))]
 use rkyv::Deserialize;
-use metrics::{counter, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::ser::{SerializeMap, Serializer};
 use socket2::SockRef;
 use std::collections::VecDeque;
@@ -285,7 +285,11 @@ fn json_event_from_archived_record(rec: &ArchivedRecord) -> JsonEvent {
                 leader,
             }
         }
-        ArchivedRecord::Slot { slot, parent, status } => {
+        ArchivedRecord::Slot {
+            slot,
+            parent,
+            status,
+        } => {
             let parent = match parent {
                 rkyv::option::ArchivedOption::Some(p) => Some(*p),
                 rkyv::option::ArchivedOption::None => None,
@@ -638,7 +642,8 @@ async fn handle_client(
                                 }
                                 let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
                                 if (v & INGEST_SAMPLE_MASK) == 0 {
-                                    counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
+                                    counter!("ultra_records_ingested_total")
+                                        .increment(INGEST_SAMPLE_WEIGHT);
                                 }
                                 buf.advance(consumed);
                                 continue;

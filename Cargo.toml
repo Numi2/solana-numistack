@@ -8,7 +8,7 @@ members = [
   "crates/jito-client",
   "crates/solana-quic-proxy",
   "crates/solana-validator-observer",
-  "crates/solana-ultra-rpc", "crates/ultra-rpc-bench",
+  "crates/solana-ultra-rpc", "crates/ultra-rpc-bench", "crates/ultra-rpc-bridge",
 ]
 
 [workspace.package]

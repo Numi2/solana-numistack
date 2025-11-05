@@ -1,0 +1,15 @@
+{
+  "uds_path": "/tmp/ultra-geyser.sock",
+  "stdout_json": true,
+  "metrics_addr": "127.0.0.1:9978",
+  "uds_recv_buf_bytes": 33554432,
+  "listeners": [
+    {
+      "uds_path": "/tmp/ultra-geyser.sock",
+      "uds_recv_buf_bytes": 33554432,
+      "max_frame_bytes": 16777216
+    }
+  ]
+}
+
+

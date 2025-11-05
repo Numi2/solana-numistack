@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["rkyv"]
 kafka = ["rdkafka"]
+rkyv = ["faststreams/rkyv", "dep:rkyv"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -21,6 +23,7 @@ metrics-exporter-prometheus = "0.15.3"
 bs58 = "0.5.1"
 socket2 = { version = "0.5.7", features = ["all"] }
 memchr = "2"
+rkyv = { version = "0.7", optional = true, features = ["validation"] }
 
 # optional sink
 rdkafka = { version = "0.36.2", optional = true, default-features = false, features = ["cmake-build", "tokio"] }

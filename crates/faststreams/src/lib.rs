@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const COMPRESS_THRESHOLD: usize = 2048;
 const IOV_MAX_DEFAULT: usize = 1024; // typical on Linux/macOS
 const INLINE_IOVEC_CAP: usize = IOV_MAX_DEFAULT;
-const FLAG_LZ4: u16 = 0x0001;
+pub const FLAG_LZ4: u16 = 0x0001;
+pub const FLAG_RKYV: u16 = 0x0002;
 
 pub const FRAME_MAGIC: u32 = 0x4653_5452; // 'FSTR'
 pub const FRAME_VERSION: u16 = 1;
@@ -34,6 +35,8 @@ const FRAME_HEADER_TEMPLATE: [u8; 12] = [
 // Exponentially weighted moving average for recent payload lengths
 static AVG_LEN: AtomicUsize = AtomicUsize::new(512);
 
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUpdate {
     pub slot: u64,
@@ -47,6 +50,8 @@ pub struct AccountUpdate {
     pub data: Vec<u8>,
 }
 
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxUpdate {
     pub slot: u64,
@@ -56,6 +61,8 @@ pub struct TxUpdate {
     pub vote: bool,
 }
 
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockMeta {
     pub slot: u64,
@@ -68,6 +75,8 @@ pub struct BlockMeta {
     pub leader: Option<[u8; 32]>,
 }
 
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "rkyv", archive_attr(derive(bytecheck::CheckBytes)))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
     Account(AccountUpdate),
@@ -100,6 +109,7 @@ pub enum RecordRef<'a> {
     Account(AccountUpdateRef<'a>),
 }
 
+
 #[derive(thiserror::Error, Debug)]
 pub enum StreamError {
     #[error("io: {0}")]
@@ -117,6 +127,14 @@ pub struct EncodeOptions {
     pub enable_compression: bool,
     pub compress_threshold: usize,
     pub payload_hint: Option<usize>,
+    pub format: PayloadFormat,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PayloadFormat {
+    Bincode,
+    #[cfg(feature = "rkyv")]
+    Rkyv,
 }
 
 impl EncodeOptions {
@@ -125,6 +143,7 @@ impl EncodeOptions {
             enable_compression: true,
             compress_threshold: COMPRESS_THRESHOLD,
             payload_hint: Some(AVG_LEN.load(Ordering::Relaxed)),
+            format: PayloadFormat::Bincode,
         }
     }
     pub fn latency_uds() -> Self {
@@ -133,6 +152,10 @@ impl EncodeOptions {
             enable_compression: false,
             compress_threshold: usize::MAX,
             payload_hint: Some(AVG_LEN.load(Ordering::Relaxed)),
+            #[cfg(feature = "rkyv")]
+            format: PayloadFormat::Rkyv,
+            #[cfg(not(feature = "rkyv"))]
+            format: PayloadFormat::Bincode,
         }
     }
     /// Throughput-oriented remote hop: enable LZ4 with a low threshold to
@@ -142,6 +165,7 @@ impl EncodeOptions {
             enable_compression: true,
             compress_threshold: 512,
             payload_hint: Some(AVG_LEN.load(Ordering::Relaxed)),
+            format: PayloadFormat::Bincode,
         }
     }
 }
@@ -173,17 +197,35 @@ pub fn encode_record_with(rec: &Record, opts: EncodeOptions) -> Result<Vec<u8>, 
         let hint = opts
             .payload_hint
             .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        bincode_opts.serialize_into(&mut buf, rec)?;
-        let payload_len = (buf.len() - 12) as u32;
-        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-        // Update EMA: len := (7*prev + payload_len)/8, min 64
-        let len = payload_len as usize;
-        let prev = AVG_LEN.load(Ordering::Relaxed);
-        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-        AVG_LEN.store(next, Ordering::Relaxed);
-        Ok(buf)
+        match opts.format {
+            PayloadFormat::Bincode => {
+                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
+                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+                bincode_opts.serialize_into(&mut buf, rec)?;
+                let payload_len = (buf.len() - 12) as u32;
+                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+                // Update EMA: len := (7*prev + payload_len)/8, min 64
+                let len = payload_len as usize;
+                let prev = AVG_LEN.load(Ordering::Relaxed);
+                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+                AVG_LEN.store(next, Ordering::Relaxed);
+                Ok(buf)
+            }
+            #[cfg(feature = "rkyv")]
+            PayloadFormat::Rkyv => {
+                // Borrowed references still serialize via bincode to avoid cloning data.
+                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
+                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+                bincode_opts.serialize_into(&mut buf, rec)?;
+                let payload_len = (buf.len() - 12) as u32;
+                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+                let len = payload_len as usize;
+                let prev = AVG_LEN.load(Ordering::Relaxed);
+                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+                AVG_LEN.store(next, Ordering::Relaxed);
+                Ok(buf)
+            }
+        }
     }
 }
 
@@ -215,17 +257,35 @@ pub fn encode_record_ref_with(
         let hint = opts
             .payload_hint
             .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        bincode_opts.serialize_into(&mut buf, rec)?;
-        let payload_len = (buf.len() - 12) as u32;
-        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-        // Update EMA
-        let len = payload_len as usize;
-        let prev = AVG_LEN.load(Ordering::Relaxed);
-        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-        AVG_LEN.store(next, Ordering::Relaxed);
-        Ok(buf)
+        match opts.format {
+            PayloadFormat::Bincode => {
+                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
+                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+                bincode_opts.serialize_into(&mut buf, rec)?;
+                let payload_len = (buf.len() - 12) as u32;
+                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+                // Update EMA: len := (7*prev + payload_len)/8, min 64
+                let len = payload_len as usize;
+                let prev = AVG_LEN.load(Ordering::Relaxed);
+                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+                AVG_LEN.store(next, Ordering::Relaxed);
+                Ok(buf)
+            }
+            #[cfg(feature = "rkyv")]
+            PayloadFormat::Rkyv => {
+                // Borrowed references still serialize via bincode to avoid cloning data.
+                let mut buf: Vec<u8> = Vec::with_capacity(12 + hint);
+                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+                bincode_opts.serialize_into(&mut buf, rec)?;
+                let payload_len = (buf.len() - 12) as u32;
+                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+                let len = payload_len as usize;
+                let prev = AVG_LEN.load(Ordering::Relaxed);
+                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+                AVG_LEN.store(next, Ordering::Relaxed);
+                Ok(buf)
+            }
+        }
     }
 }
 
@@ -258,17 +318,30 @@ pub fn encode_record_ref_into_with(
         let hint = opts
             .payload_hint
             .unwrap_or_else(|| AVG_LEN.load(Ordering::Relaxed));
-        buf.reserve(12 + hint);
-        buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
-        bincode_opts.serialize_into(&mut *buf, rec)?;
-        let payload_len = (buf.len() - 12) as u32;
-        buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
-        // Update EMA
-        let len = payload_len as usize;
-        let prev = AVG_LEN.load(Ordering::Relaxed);
-        let next = ((prev.saturating_mul(7) + len) / 8).max(64);
-        AVG_LEN.store(next, Ordering::Relaxed);
-        Ok(())
+        match opts.format {
+            PayloadFormat::Bincode => {
+                buf.reserve(12 + hint);
+                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+                bincode_opts.serialize_into(&mut *buf, rec)?;
+                let payload_len = (buf.len() - 12) as u32;
+                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+                // Update EMA
+                let len = payload_len as usize;
+                let prev = AVG_LEN.load(Ordering::Relaxed);
+                let next = ((prev.saturating_mul(7) + len) / 8).max(64);
+                AVG_LEN.store(next, Ordering::Relaxed);
+                Ok(())
+            }
+            #[cfg(feature = "rkyv")]
+            PayloadFormat::Rkyv => {
+                buf.reserve(12 + hint);
+                buf.extend_from_slice(&FRAME_HEADER_TEMPLATE);
+                bincode_opts.serialize_into(&mut *buf, rec)?;
+                let payload_len = (buf.len() - 12) as u32;
+                buf[8..12].copy_from_slice(&payload_len.to_be_bytes());
+                Ok(())
+            }
+        }
     }
 }
 
@@ -318,6 +391,34 @@ pub fn encode_into_with(
 
 pub fn encode_record(rec: &Record) -> Result<Vec<u8>, StreamError> {
     encode_record_with(rec, EncodeOptions::default_throughput())
+}
+
+#[cfg(feature = "rkyv")]
+pub fn decode_record_archived_from_slice<'a>(
+    src: &'a [u8],
+) -> Result<(&'a ArchivedRecord, usize), StreamError> {
+    if src.len() < 12 {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    let magic = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+    let ver = u16::from_be_bytes([src[4], src[5]]);
+    if magic != FRAME_MAGIC || ver != FRAME_VERSION {
+        return Err(StreamError::BadHeader);
+    }
+    let flags = u16::from_be_bytes([src[6], src[7]]);
+    let len = u32::from_be_bytes([src[8], src[9], src[10], src[11]]) as usize;
+    let total = 12 + len;
+    if src.len() < total {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    if (flags & FLAG_LZ4) != 0 {
+        return Err(StreamError::De(Box::new(bincode::ErrorKind::SizeLimit)));
+    }
+    let body = &src[12..total];
+    let rec = rkyv::check_archived_root::<Record>(body).map_err(|e| {
+        StreamError::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    })?;
+    Ok((rec, total))
 }
 
 pub fn decode_record(mut src: impl Read) -> Result<Record, StreamError> {

@@ -4,6 +4,14 @@
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use faststreams::{decode_record_from_slice, Record};
+#[cfg(feature = "rkyv")]
+use faststreams::{decode_record_archived_from_slice, ArchivedRecord, FLAG_LZ4, FLAG_RKYV};
+#[cfg(feature = "rkyv")]
+use rkyv;
+#[cfg(all(feature = "rkyv", feature = "kafka"))]
+use rkyv::de::deserializers::SharedDeserializeMap;
+#[cfg(all(feature = "rkyv", feature = "kafka"))]
+use rkyv::Deserialize;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::ser::{SerializeMap, Serializer};
@@ -223,6 +231,72 @@ fn json_event_owned_from_record(rec: &Record) -> JsonEvent {
             status: *status,
         },
         Record::EndOfStartup => JsonEvent::EndOfStartup,
+    }
+}
+
+#[cfg(feature = "rkyv")]
+fn json_event_from_archived_record(rec: &ArchivedRecord) -> JsonEvent {
+    match rec {
+        ArchivedRecord::Account(a) => JsonEvent::Account {
+            slot: a.slot,
+            is_startup: a.is_startup,
+            pubkey: a.pubkey,
+            lamports: a.lamports,
+            owner: a.owner,
+            executable: a.executable,
+            rent_epoch: a.rent_epoch,
+            data_len: a.data.len() as usize,
+        },
+        ArchivedRecord::Tx(t) => {
+            let err = match &t.err {
+                rkyv::option::ArchivedOption::Some(s) => Some(s.as_str().to_owned()),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            JsonEvent::Tx {
+                slot: t.slot,
+                signature: t.signature,
+                err,
+                vote: t.vote,
+            }
+        }
+        ArchivedRecord::Block(b) => {
+            let blockhash = match &b.blockhash {
+                rkyv::option::ArchivedOption::Some(h) => Some(*h),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            let parent_slot = match &b.parent_slot {
+                rkyv::option::ArchivedOption::Some(x) => Some(*x),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            let block_time_unix = match &b.block_time_unix {
+                rkyv::option::ArchivedOption::Some(x) => Some(*x),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            let leader = match &b.leader {
+                rkyv::option::ArchivedOption::Some(p) => Some(*p),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            JsonEvent::Block {
+                slot: b.slot,
+                blockhash,
+                parent_slot,
+                rewards_len: b.rewards_len,
+                block_time_unix,
+                leader,
+            }
+        }
+        ArchivedRecord::Slot { slot, parent, status } => {
+            let parent = match parent {
+                rkyv::option::ArchivedOption::Some(p) => Some(*p),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            JsonEvent::Slot {
+                slot: *slot,
+                parent,
+                status: *status,
+            }
+        }
+        ArchivedRecord::EndOfStartup => JsonEvent::EndOfStartup,
     }
 }
 
@@ -534,6 +608,42 @@ async fn handle_client(
                         buf.clear();
                     }
                     break;
+                }
+            }
+            #[cfg(feature = "rkyv")]
+            {
+                if buf.len() >= 12 {
+                    let flags = u16::from_be_bytes([buf[6], buf[7]]);
+                    if (flags & FLAG_RKYV) != 0 && (flags & FLAG_LZ4) == 0 {
+                        match decode_record_archived_from_slice(&buf[..]) {
+                            Ok((arec, consumed)) => {
+                                if let Some(js) = &json {
+                                    let evt = json_event_from_archived_record(arec);
+                                    if !js.try_send(evt) {
+                                        counter!("ultra_json_dropped_total").increment(1);
+                                    }
+                                }
+                                #[cfg(feature = "kafka")]
+                                if let Some(k) = &ks {
+                                    // Deserialize only for Kafka sink (selective conversion)
+                                    let mut map = SharedDeserializeMap::new();
+                                    match arec.deserialize(&mut map) {
+                                        Ok(rec) => k.try_send(rec),
+                                        Err(_) => {
+                                            counter!("ultra_kafka_deser_errors_total").increment(1);
+                                        }
+                                    }
+                                }
+                                let v = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
+                                if (v & INGEST_SAMPLE_MASK) == 0 {
+                                    counter!("ultra_records_ingested_total").increment(INGEST_SAMPLE_WEIGHT);
+                                }
+                                buf.advance(consumed);
+                                continue;
+                            }
+                            Err(_) => { /* fall through to bincode path */ }
+                        }
+                    }
                 }
             }
             match decode_record_from_slice(&buf[..], &mut scratch) {

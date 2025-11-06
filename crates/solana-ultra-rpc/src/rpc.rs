@@ -73,7 +73,7 @@ impl RpcRouter {
                 let slot = self.slots.load();
                 self.metrics
                     .record_request("getSlot", start.elapsed().as_secs_f64(), 0);
-                Ok(RpcResult::Slot(RpcResponse::new(slot, slot)))
+                Ok(RpcResult::Slot(slot))
             }
             other => {
                 let start = Instant::now();
@@ -277,8 +277,8 @@ pub enum RpcResult {
     AccountInfo(RpcResponse<Option<AccountInfoValue>>),
     /// Response payload for `getMultipleAccounts` requests.
     MultipleAccounts(RpcResponse<Vec<Option<AccountInfoValue>>>),
-    /// Response payload for `getSlot` requests.
-    Slot(RpcResponse<u64>),
+    /// Response payload for `getSlot` requests (plain number per spec).
+    Slot(u64),
 }
 
 impl Serialize for RpcResult {
@@ -289,7 +289,7 @@ impl Serialize for RpcResult {
         match self {
             Self::AccountInfo(response) => response.serialize(serializer),
             Self::MultipleAccounts(response) => response.serialize(serializer),
-            Self::Slot(response) => response.serialize(serializer),
+            Self::Slot(value) => value.serialize(serializer),
         }
     }
 }
@@ -716,6 +716,14 @@ pub struct RpcCallError {
 }
 
 impl RpcCallError {
+    /// Public constructor for a generic invalid request error (-32600).
+    pub fn invalid_request() -> Self {
+        Self {
+            code: -32600,
+            message: "invalid request".into(),
+            data: None,
+        }
+    }
     fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             code: -32602,

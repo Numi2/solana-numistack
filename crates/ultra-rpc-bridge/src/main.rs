@@ -5,14 +5,14 @@ use anyhow::{Context, Result};
 use bytes::{Buf, BytesMut};
 use clap::Parser;
 use faststreams::{decode_record_from_slice, Record};
-use futures_util::sink::SinkExt;
+use futures_util::SinkExt;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
@@ -182,140 +182,123 @@ async fn run_delta_writer(path: String, mut rx: mpsc::Receiver<Vec<u8>>) {
     }
 }
 
-async fn run_bridge(args: Args, snapshot_tx: mpsc::Sender<Vec<u8>>, delta_tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
-    // Connect to aggregator input
-    let mut stream = UnixStream::connect(&args.input_uds)
-        .await
-        .with_context(|| format!("connect {} failed", &args.input_uds))?;
-    // Best-effort: increase recv buffer
+async fn run_bridge(
+    args: Args,
+    snapshot_tx: mpsc::Sender<Vec<u8>>,
+    delta_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    // Bind input UDS and accept producers (e.g., ys-consumer or load generator)
+    if std::path::Path::new(&args.input_uds).exists() {
+        let _ = std::fs::remove_file(&args.input_uds);
+    }
+    let listener = UnixListener::bind(&args.input_uds)
+        .with_context(|| format!("bind {} failed", &args.input_uds))?;
     #[cfg(unix)]
     {
-        let _ = socket2::SockRef::from(&stream).set_recv_buffer_size(32 * 1024 * 1024);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&args.input_uds, std::fs::Permissions::from_mode(0o660));
     }
-    info!(uds = %args.input_uds, "bridge connected to aggregator");
+    info!(uds = %args.input_uds, "bridge input listening");
 
-    let mut buf = BytesMut::with_capacity(1 << 20);
-
-    // Snapshot state
+    // Snapshot and batching state lives across client connections
     let mut snapshot_accounts: HashMap<[u8; 32], AccountWire> = HashMap::new();
     let mut snapshot_active = true;
     let mut snapshot_last_slot: u64 = 0;
-    // Allow closing the snapshot stream once emitted
     let mut snapshot_sender: Option<mpsc::Sender<Vec<u8>>> = Some(snapshot_tx);
-
-    // Delta batcher
     let mut delta_batch: Vec<DeltaWire> = Vec::with_capacity(args.delta_batch_max);
     let mut last_flush = Instant::now();
     let flush_interval = Duration::from_millis(args.delta_flush_ms);
-
     let mut scratch: Vec<u8> = Vec::with_capacity(8 * 1024);
 
     loop {
-        let n = stream.read_buf(&mut buf).await?;
-        if n == 0 {
-            warn!("aggregator stream closed");
-            break;
+        let (mut sock, _) = listener.accept().await?;
+        #[cfg(unix)]
+        {
+            let _ = socket2::SockRef::from(&sock).set_recv_buffer_size(32 * 1024 * 1024);
         }
+        info!("bridge accepted producer connection");
+        let mut buf = BytesMut::with_capacity(1 << 20);
         loop {
-            match decode_record_from_slice(&buf[..], &mut scratch) {
-                Ok((rec, consumed)) => {
-                    buf.advance(consumed);
-                    match rec {
-                        Record::Account(a) => {
-                            // Convert to wire
-                            let wire = AccountWire {
-                                pubkey: a.pubkey,
-                                lamports: a.lamports,
-                                owner: a.owner,
-                                executable: a.executable,
-                                rent_epoch: a.rent_epoch,
-                                data: a.data,
-                            };
-                            if snapshot_active && a.is_startup {
-                                snapshot_last_slot = snapshot_last_slot.max(a.slot);
-                                snapshot_accounts.insert(a.pubkey, wire);
-                                gauge!("rpc_bridge_snapshot_accounts").set(snapshot_accounts.len() as f64);
-                            } else {
-                                // First non-startup ends snapshot; emit segments once
-                                if snapshot_active {
-                                    snapshot_active = false;
-                                    if let Some(tx) = snapshot_sender.take() {
-                                        emit_snapshot_segments(
-                                        snapshot_last_slot,
-                                        args.snapshot_segment_accounts,
-                                        &snapshot_accounts,
-                                            &tx,
-                                        )
-                                        .await;
-                                        // dropping tx closes the writer after it drains
-                                    }
-                                    info!(accounts = snapshot_accounts.len(), slot = snapshot_last_slot, "snapshot emitted");
-                                    // Drop snapshot map to release memory
-                                }
-                                // Append to delta batch
-                                delta_batch.push(DeltaWire {
+            let n = sock.read_buf(&mut buf).await?;
+            if n == 0 {
+                info!("producer disconnected");
+                break;
+            }
+            // decode frames
+            loop {
+                match decode_record_from_slice(&buf[..], &mut scratch) {
+                    Ok((rec, consumed)) => {
+                        buf.advance(consumed);
+                        match rec {
+                            Record::Account(a) => {
+                                let wire = AccountWire {
                                     pubkey: a.pubkey,
-                                    slot: a.slot,
-                                    account: Some(wire),
-                                });
+                                    lamports: a.lamports,
+                                    owner: a.owner,
+                                    executable: a.executable,
+                                    rent_epoch: a.rent_epoch,
+                                    data: a.data,
+                                };
+                                if snapshot_active && a.is_startup {
+                                    snapshot_last_slot = snapshot_last_slot.max(a.slot);
+                                    snapshot_accounts.insert(a.pubkey, wire);
+                                    gauge!("rpc_bridge_snapshot_accounts").set(snapshot_accounts.len() as f64);
+                                } else {
+                                    if snapshot_active {
+                                        snapshot_active = false;
+                                        if let Some(tx) = snapshot_sender.take() {
+                                            emit_snapshot_segments(
+                                                snapshot_last_slot,
+                                                args.snapshot_segment_accounts,
+                                                &snapshot_accounts,
+                                                &tx,
+                                            )
+                                            .await;
+                                            // drop tx to close snapshot stream
+                                        }
+                                        info!(accounts = snapshot_accounts.len(), slot = snapshot_last_slot, "snapshot emitted");
+                                    }
+                                    delta_batch.push(DeltaWire {
+                                        pubkey: a.pubkey,
+                                        slot: a.slot,
+                                        account: Some(wire),
+                                    });
+                                }
                             }
+                            Record::Slot { .. } => {}
+                            _ => {}
                         }
-                        Record::Slot { slot, parent: _, status: _ } => {
-                            // Slot updates not required for the cache; skip or could be used later
-                            let _ = slot;
-                        }
-                        _ => {}
+                    }
+                    Err(faststreams::StreamError::De(_)) => break,
+                    Err(faststreams::StreamError::BadHeader) => {
+                        counter!("rpc_bridge_bad_header_total").increment(1);
+                        buf.advance(1);
+                        break;
+                    }
+                    Err(_) => {
+                        buf.advance(1);
+                        break;
                     }
                 }
-                Err(faststreams::StreamError::De(_)) => {
-                    // need more
-                    break;
-                }
-                Err(faststreams::StreamError::BadHeader) => {
-                    counter!("rpc_bridge_bad_header_total").increment(1);
-                    buf.advance(1);
-                    break;
-                }
-                Err(_) => {
-                    // Other stream errors: advance one byte to resync
-                    buf.advance(1);
-                    break;
-                }
             }
-        }
 
-        // Periodic delta flush
-        if !delta_batch.is_empty() && (delta_batch.len() >= args.delta_batch_max || last_flush.elapsed() >= flush_interval) {
-            let batch = DeltaWireBatch { updates: std::mem::take(&mut delta_batch) };
-            match bincode::serialize(&batch) {
-                Ok(bytes) => {
-                    let _ = delta_tx.send(bytes).await;
-                    counter!("rpc_bridge_delta_batches").increment(1);
+            // Flush deltas periodically
+            if !delta_batch.is_empty()
+                && (delta_batch.len() >= args.delta_batch_max
+                    || last_flush.elapsed() >= flush_interval)
+            {
+                let batch = DeltaWireBatch { updates: std::mem::take(&mut delta_batch) };
+                match bincode::serialize(&batch) {
+                    Ok(bytes) => {
+                        let _ = delta_tx.send(bytes).await;
+                        counter!("rpc_bridge_delta_batches").increment(1);
+                    }
+                    Err(e) => warn!(%e, "delta serialize error"),
                 }
-                Err(e) => warn!(%e, "delta serialize error"),
+                last_flush = Instant::now();
             }
-            last_flush = Instant::now();
         }
     }
-
-    // Final snapshot emit if we never saw non-startup
-    if snapshot_active {
-        if let Some(tx) = snapshot_sender.take() {
-            if !snapshot_accounts.is_empty() {
-                emit_snapshot_segments(
-                    snapshot_last_slot,
-                    args.snapshot_segment_accounts,
-                    &snapshot_accounts,
-                    &tx,
-                )
-                .await;
-            }
-            // Close snapshot stream even if empty to allow RPC to proceed
-            drop(tx);
-        }
-    }
-
-    Ok(())
 }
 
 async fn emit_snapshot_segments(

@@ -20,5 +20,5 @@ metrics-exporter-prometheus = "0.15.3"
 clap = { version = "4.5.20", features = ["derive"] }
 socket2 = "0.5"
 serde_json = { workspace = true }
-futures-util = "0.3.31"
+futures-util = { version = "0.3.31", features = ["sink"] }
 

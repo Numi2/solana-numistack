@@ -172,28 +172,150 @@ async fn handle_stream(
 
         let len = u32::from_be_bytes(header) as usize;
         if len == 0 || len > MAX_FRAME_LEN {
-            anyhow::bail!("invalid frame length {len}; max allowed {MAX_FRAME_LEN}");
+            // Send a JSON-RPC error instead of closing abruptly, to avoid client read errors.
+            let id = JsonRpcId::from_raw(None);
+            let response: JsonRpcMessage<()> = JsonRpcMessage::error(id, RpcCallError::invalid_request());
+            buffers.begin_response();
+            serde_json::to_writer(&mut buffers.response, &response)?;
+            let frame_len = buffers.response.len() - FRAME_HEADER;
+            buffers.response[..FRAME_HEADER].copy_from_slice(&(frame_len as u32).to_be_bytes());
+            send.write_all(&buffers.response).await?;
+            continue;
         }
 
         buffers.read_payload(recv, len).await?;
 
-        let request: JsonRpcRequest<'_> = simd_json::from_slice(buffers.payload.as_mut_slice())?;
-        let JsonRpcRequest {
-            id, method, params, ..
-        } = request;
-        let id = JsonRpcId::from_raw(id);
-        // Only idempotent read-only methods are supported; future mutating methods should be
-        // rejected on early-data paths.
-        let response = {
-            let method_ref = method;
-            let params_ref = params;
-            match router.handle(method_ref, params_ref).await {
-                Ok(result) => JsonRpcMessage::success(id.clone(), result),
-                Err(err) => JsonRpcMessage::error(id, err),
-            }
-        };
+        // Decide if this is a batch (first non-whitespace is '[')
+        let is_batch = buffers
+            .payload
+            .iter()
+            .copied()
+            .skip_while(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+            .next()
+            .map(|b| b == b'[')
+            .unwrap_or(false);
+
+        // Parse request(s); fall back to an error response on malformed JSON
+        // Use serde_json for robustness; performance is dominated by cache lookup
         buffers.begin_response();
-        simd_json::to_writer(&mut buffers.response, &response)?;
+        if is_batch {
+            // Batch request: parse an array of requests
+            let parsed: Result<Vec<JsonRpcRequest<'_>>, _> =
+                serde_json::from_slice(&buffers.payload);
+            match parsed {
+                Ok(reqs) if !reqs.is_empty() => {
+                    debug!(count = reqs.len(), bytes = buffers.payload.len(), "rpc batch received");
+                    let mut out: Vec<JsonRpcMessage<_>> = Vec::with_capacity(reqs.len());
+                    for JsonRpcRequest { id, method, params, .. } in reqs {
+                        let id = JsonRpcId::from_raw(id);
+                        let msg = match router.handle(method, params).await {
+                            Ok(result) => JsonRpcMessage::success(id.clone(), result),
+                            Err(err) => JsonRpcMessage::error(id, err),
+                        };
+                        out.push(msg);
+                    }
+                    serde_json::to_writer(&mut buffers.response, &out)?;
+                }
+                Ok(_empty) => {
+                    // Empty batch is an invalid request per JSON-RPC 2.0
+                    let id = JsonRpcId::from_raw(None);
+                    let resp: JsonRpcMessage<()> =
+                        JsonRpcMessage::error(id, RpcCallError::invalid_request());
+                    serde_json::to_writer(&mut buffers.response, &resp)?;
+                }
+                Err(_) => {
+                    // Try a best-effort generic parse to salvage
+                    match serde_json::from_slice::<serde_json::Value>(&buffers.payload) {
+                        Ok(val) => {
+                            // If it is an array but contents are unusable, still return invalid request
+                            if val.is_array() {
+                                let id = JsonRpcId::from_raw(None);
+                                let resp: JsonRpcMessage<()> =
+                                    JsonRpcMessage::error(id, RpcCallError::invalid_request());
+                                serde_json::to_writer(&mut buffers.response, &resp)?;
+                            } else {
+                                let method = val
+                                    .get("method")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("");
+                                let id = JsonRpcId::from_json_value(
+                                    val.get("id").unwrap_or(&serde_json::Value::Null),
+                                );
+                                let resp = match router.handle(method, None).await {
+                                    Ok(result) => JsonRpcMessage::success(id.clone(), result),
+                                    Err(err) => JsonRpcMessage::error(id, err),
+                                };
+                                simd_json::to_writer(&mut buffers.response, &resp)?;
+                            }
+                        }
+                        Err(_) => {
+                            let preview = if buffers.payload.len() <= 256 {
+                                String::from_utf8_lossy(&buffers.payload).into_owned()
+                            } else {
+                                let mut s =
+                                    String::from_utf8_lossy(&buffers.payload[..256]).into_owned();
+                                s.push_str("…");
+                                s
+                            };
+                            debug!(len = buffers.payload.len(), preview = %preview, "json parse failed");
+                            let id = JsonRpcId::from_raw(None);
+                            let resp: JsonRpcMessage<()> =
+                                JsonRpcMessage::error(id, RpcCallError::invalid_request());
+                            serde_json::to_writer(&mut buffers.response, &resp)?;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single-request path
+            let parsed: Result<JsonRpcRequest<'_>, _> =
+                serde_json::from_slice(&buffers.payload);
+            match parsed {
+                Ok(JsonRpcRequest { id, method, params, .. }) => {
+                    debug!(method = %method, bytes = buffers.payload.len(), "rpc request received");
+                    let id = JsonRpcId::from_raw(id);
+                    let resp = match router.handle(method, params).await {
+                        Ok(result) => JsonRpcMessage::success(id.clone(), result),
+                        Err(err) => JsonRpcMessage::error(id, err),
+                    };
+                    serde_json::to_writer(&mut buffers.response, &resp)?;
+                }
+                Err(_) => {
+                    // Try a best-effort generic parse to salvage the request
+                    match serde_json::from_slice::<serde_json::Value>(&buffers.payload) {
+                        Ok(val) => {
+                            let method = val
+                                .get("method")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("");
+                            let id = JsonRpcId::from_json_value(
+                                val.get("id").unwrap_or(&serde_json::Value::Null),
+                            );
+                            let resp = match router.handle(method, None).await {
+                                Ok(result) => JsonRpcMessage::success(id.clone(), result),
+                                Err(err) => JsonRpcMessage::error(id, err),
+                            };
+                            serde_json::to_writer(&mut buffers.response, &resp)?;
+                        }
+                        Err(_) => {
+                            let preview = if buffers.payload.len() <= 256 {
+                                String::from_utf8_lossy(&buffers.payload).into_owned()
+                            } else {
+                                let mut s =
+                                    String::from_utf8_lossy(&buffers.payload[..256]).into_owned();
+                                s.push_str("…");
+                                s
+                            };
+                            debug!(len = buffers.payload.len(), preview = %preview, "json parse failed");
+                            let id = JsonRpcId::from_raw(None);
+                            let resp: JsonRpcMessage<()> =
+                                JsonRpcMessage::error(id, RpcCallError::invalid_request());
+                            serde_json::to_writer(&mut buffers.response, &resp)?;
+                        }
+                    }
+                }
+            }
+        }
         let frame_len = buffers.response.len() - FRAME_HEADER;
         anyhow::ensure!(
             frame_len <= MAX_FRAME_LEN,
@@ -221,6 +343,14 @@ fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
     let cert = rcgen::Certificate::from_params(params)?;
     let key = PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
     let cert_der: CertificateDer<'static> = CertificateDer::from(cert.serialize_der()?);
+
+    // Optionally export the self-signed certificate for clients to trust (development only)
+    if let Ok(path) = std::env::var("ULTRA_RPC_CERT_OUT") {
+        if let Ok(pem) = cert.serialize_pem() {
+            let _ = std::fs::write(&path, pem);
+            info!(path = %path, "wrote self-signed certificate (PEM)");
+        }
+    }
 
     // Build rustls server config to set ALPN and (implicitly) allow safe 0-RTT reads.
     let mut tls_config = rustls::ServerConfig::builder()
@@ -329,4 +459,17 @@ impl Serialize for JsonRpcId {
 
 fn default_jsonrpc() -> &'static str {
     "2.0"
+}
+
+impl JsonRpcId {
+    #[inline]
+    fn from_json_value(value: &serde_json::Value) -> Self {
+        match serde_json::to_string(value)
+            .ok()
+            .and_then(|s| serde_json::value::RawValue::from_string(s).ok())
+        {
+            Some(raw) => Self { raw: Some(raw) },
+            None => Self { raw: None },
+        }
+    }
 }

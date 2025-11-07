@@ -1634,7 +1634,7 @@ dependencies = [
  "faststreams",
  "libc",
  "log",
- "metrics",
+ "metrics 0.23.1",
  "metrics-exporter-prometheus",
  "nix 0.29.0",
  "parking_lot",
@@ -2428,6 +2428,17 @@ dependencies = [
 
 [[package]]
 name = "metrics"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fde3af1a009ed76a778cb84fdef9e7dbbdf5775ae3e4cc1f434a6a307f6f76c5"
+dependencies = [
+ "ahash 0.8.12",
+ "metrics-macros",
+ "portable-atomic",
+]
+
+[[package]]
+name = "metrics"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3045b4193fbdc5b5681f32f11070da9be3609f189a79f3390706d42587f46bb5"
@@ -2449,12 +2460,23 @@ dependencies = [
  "hyper-util",
  "indexmap 2.12.0",
  "ipnet",
- "metrics",
+ "metrics 0.23.1",
  "metrics-util",
  "quanta",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "metrics-macros"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b4faf00617defe497754acde3024865bc143d44a86799b24e191ecff91354f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
 ]
 
 [[package]]
@@ -2466,7 +2488,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "metrics",
+ "metrics 0.23.1",
  "num_cpus",
  "quanta",
  "sketches-ddsketch",
@@ -5270,6 +5292,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hashbrown 0.14.5",
+ "metrics 0.21.1",
  "once_cell",
  "opentelemetry",
  "opentelemetry-prometheus",
@@ -6280,7 +6303,7 @@ dependencies = [
  "bytes",
  "faststreams",
  "memchr",
- "metrics",
+ "metrics 0.23.1",
  "metrics-exporter-prometheus",
  "rdkafka",
  "rkyv",
@@ -6300,6 +6323,7 @@ dependencies = [
  "clap",
  "faststreams",
  "humantime",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -6317,7 +6341,7 @@ dependencies = [
  "clap",
  "faststreams",
  "futures-util",
- "metrics",
+ "metrics 0.23.1",
  "metrics-exporter-prometheus",
  "serde",
  "serde_json",
@@ -6924,7 +6948,7 @@ dependencies = [
  "faststreams",
  "futures",
  "memmap2",
- "metrics",
+ "metrics 0.23.1",
  "metrics-exporter-prometheus",
  "socket2 0.5.10",
  "tokio",

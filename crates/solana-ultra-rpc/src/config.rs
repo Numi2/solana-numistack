@@ -26,6 +26,12 @@ pub struct UltraRpcConfig {
     pub queue_depth: usize,
     /// Optional upstream HTTP endpoint for cache misses.
     pub fallback_url: Option<String>,
+    /// QUIC per-stream receive window (bytes).
+    pub quic_stream_recv_window: u64,
+    /// QUIC connection-wide receive window (bytes).
+    pub quic_conn_recv_window: u64,
+    /// QUIC max idle timeout before disconnect (None disables timeout).
+    pub quic_max_idle_timeout: Option<Duration>,
 }
 
 impl Default for UltraRpcConfig {
@@ -41,6 +47,9 @@ impl Default for UltraRpcConfig {
             max_batch_size: 128,
             queue_depth: 16_384,
             fallback_url: None,
+            quic_stream_recv_window: 4 * 1024 * 1024,
+            quic_conn_recv_window: 32 * 1024 * 1024,
+            quic_max_idle_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -61,6 +70,11 @@ impl UltraRpcConfig {
             self.max_streams > 0,
             "must allow at least one concurrent stream"
         );
+        // Validate QUIC window sizes fit into VarInt
+        let _ = quinn::VarInt::try_from(self.quic_stream_recv_window)
+            .map_err(|_| anyhow::anyhow!("quic_stream_recv_window exceeds QUIC VarInt maximum"))?;
+        let _ = quinn::VarInt::try_from(self.quic_conn_recv_window)
+            .map_err(|_| anyhow::anyhow!("quic_conn_recv_window exceeds QUIC VarInt maximum"))?;
         Ok(())
     }
 }

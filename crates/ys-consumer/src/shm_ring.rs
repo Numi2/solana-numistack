@@ -164,6 +164,4 @@ impl ShmRingWriter {
         counter!("ys_consumer_shm_written_total").increment(1);
         true
     }
-
-    
 }

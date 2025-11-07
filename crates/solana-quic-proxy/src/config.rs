@@ -30,6 +30,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1200;
 const DEFAULT_HEDGED_ATTEMPTS: u32 = 1;
 const DEFAULT_HEDGE_JITTER_MS: u64 = 25;
 const DEFAULT_ENABLE_EARLY_DATA: bool = true;
+const DEFAULT_PREOPEN_STREAMS: u32 = 0;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -125,6 +126,10 @@ pub struct CliArgs {
     /// Allow TLS early data (0-RTT) for idempotent RPCs.
     #[arg(long)]
     pub enable_early_data: Option<bool>,
+
+    /// Number of bi-directional streams to pre-open during warmup.
+    #[arg(long)]
+    pub preopen_streams: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +156,7 @@ pub struct Config {
     pub hedged_attempts: u32,
     pub hedge_jitter: Duration,
     pub enable_early_data: bool,
+    pub preopen_streams: u32,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -176,6 +182,7 @@ struct FileConfig {
     hedged_attempts: Option<u32>,
     hedge_jitter_ms: Option<u64>,
     enable_early_data: Option<bool>,
+    preopen_streams: Option<u32>,
 }
 
 impl Config {
@@ -350,6 +357,11 @@ fn merge(cli: &CliArgs, file_cfg: Option<(PathBuf, FileConfig)>) -> Result<Confi
         file_cfg.enable_early_data,
         DEFAULT_ENABLE_EARLY_DATA,
     );
+    let preopen_streams = pick(
+        cli.preopen_streams,
+        file_cfg.preopen_streams,
+        DEFAULT_PREOPEN_STREAMS,
+    );
 
     Ok(Config {
         listen,
@@ -374,6 +386,7 @@ fn merge(cli: &CliArgs, file_cfg: Option<(PathBuf, FileConfig)>) -> Result<Confi
         hedged_attempts,
         hedge_jitter: Duration::from_millis(hedge_jitter_ms),
         enable_early_data,
+        preopen_streams,
     })
 }
 

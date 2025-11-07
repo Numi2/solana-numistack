@@ -97,7 +97,7 @@ pub fn run_writer(
             if let Some(item) = queue.pop() {
                 return PopOutcome::Item(item);
             }
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Acquire) {
                 return PopOutcome::Shutdown;
             }
             if timeout != Duration::ZERO && start.elapsed() >= timeout {
@@ -125,7 +125,7 @@ pub fn run_writer(
     }
     gauge!("ultra_writer_alive", "shard" => writer_index.to_string()).set(1.0);
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
 
@@ -211,7 +211,7 @@ pub fn run_writer(
                 let mut batch: Vec<PooledBuf> = Vec::with_capacity(cfg.batch_max);
                 let mut cur_flush_after_ms = cfg.flush_after_ms;
                 loop {
-                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    if shutdown.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
                     let depth = queue.len() as u64;
@@ -238,10 +238,11 @@ pub fn run_writer(
                                 match queue.pop() {
                                     Some(m) => {
                                         let mlen = m.as_slice().map(|s| s.len()).unwrap_or(0);
-                                        if size + mlen > cfg.batch_bytes_max {
+                                        let new_size = size.saturating_add(mlen);
+                                        if new_size > cfg.batch_bytes_max {
                                             break;
                                         }
-                                        size += mlen;
+                                        size = new_size;
                                         batch.push(m);
                                         continue;
                                     }
@@ -257,10 +258,11 @@ pub fn run_writer(
                                                 PopOutcome::Item(m) => {
                                                     let mlen =
                                                         m.as_slice().map(|s| s.len()).unwrap_or(0);
-                                                    if size + mlen > cfg.batch_bytes_max {
+                                                    let new_size = size.saturating_add(mlen);
+                                                    if new_size > cfg.batch_bytes_max {
                                                         break;
                                                     }
-                                                    size += mlen;
+                                                    size = new_size;
                                                     batch.push(m);
                                                     continue;
                                                 }
@@ -344,7 +346,7 @@ pub fn run_writer(
                                                         ));
                                                     }
                                                     if shutdown
-                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                        .load(std::sync::atomic::Ordering::Acquire)
                                                     {
                                                         break;
                                                     }
@@ -414,7 +416,7 @@ pub fn run_writer(
                                                         ));
                                                     }
                                                     if shutdown
-                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                        .load(std::sync::atomic::Ordering::Acquire)
                                                     {
                                                         break;
                                                     }
@@ -477,7 +479,7 @@ pub fn run_writer(
                             batch = send_batch;
                         }
                         PopOutcome::Timeout => {
-                            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
                                 break;
                             } else {
                                 continue;

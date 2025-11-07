@@ -36,6 +36,7 @@ pub struct QuicRpcClient {
     hedged_attempts: u32,
     hedge_jitter: Duration,
     enable_early_data: bool,
+    config: Arc<Config>,
 }
 
 pub struct ClientResponse {
@@ -64,11 +65,22 @@ impl QuicRpcClient {
             hedged_attempts: config.hedged_attempts,
             hedge_jitter: config.hedge_jitter,
             enable_early_data: config.enable_early_data,
+            config,
         })
     }
 
     pub async fn warmup(&self) -> Result<(), ProxyError> {
-        let _ = self.connection().await?;
+        let conn = self.connection().await?;
+        // Optionally pre-open a small number of bi-directional streams to warm up path/allocations.
+        let streams = self.config.preopen_streams;
+        for _ in 0..streams {
+            let (_send, _recv) = conn
+                .open_bi()
+                .await
+                .map_err(ProxyError::Connection)?;
+            // Immediately finish to return credits
+            // Drop streams; we only care about handshake/allocation warmup.
+        }
         Ok(())
     }
 

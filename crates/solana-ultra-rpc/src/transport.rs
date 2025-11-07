@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Connection, Endpoint, ReadExactError, ServerConfig, TransportConfig, VarInt};
+use quinn::{Connection, Endpoint, ReadExactError, ServerConfig, TransportConfig, VarInt, IdleTimeout};
 use rcgen::{CertificateParams, DistinguishedName, DnType, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::ser::SerializeStruct;
@@ -13,9 +13,14 @@ use serde_json::value::RawValue;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt as FuturesStreamExt;
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::config::UltraRpcConfig;
 use crate::rpc::{RpcCallError, RpcRouter};
+use crate::rpc::RpcResult;
 
 /// Length prefix size for framing (u32 big endian).
 const FRAME_HEADER: usize = 4;
@@ -34,7 +39,7 @@ pub struct QuicRpcServer {
 impl QuicRpcServer {
     /// Bind a new QUIC listener and start accepting JSON-RPC traffic.
     pub async fn bind(config: &UltraRpcConfig, router: Arc<RpcRouter>) -> Result<Self> {
-        let server_config = build_server_config(config.max_streams)?;
+        let server_config = build_server_config(config)?;
         let endpoint = Endpoint::server(server_config, config.rpc_bind)?;
         info!(addr = %config.rpc_bind, "solana-ultra-rpc listening on QUIC");
 
@@ -174,7 +179,8 @@ async fn handle_stream(
         if len == 0 || len > MAX_FRAME_LEN {
             // Send a JSON-RPC error instead of closing abruptly, to avoid client read errors.
             let id = JsonRpcId::from_raw(None);
-            let response: JsonRpcMessage<()> = JsonRpcMessage::error(id, RpcCallError::invalid_request());
+            let response: JsonRpcMessage<()> =
+                JsonRpcMessage::error(id, RpcCallError::invalid_request());
             buffers.begin_response();
             serde_json::to_writer(&mut buffers.response, &response)?;
             let frame_len = buffers.response.len() - FRAME_HEADER;
@@ -190,8 +196,7 @@ async fn handle_stream(
             .payload
             .iter()
             .copied()
-            .skip_while(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
-            .next()
+            .find(|b| !matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
             .map(|b| b == b'[')
             .unwrap_or(false);
 
@@ -200,28 +205,25 @@ async fn handle_stream(
         buffers.begin_response();
         if is_batch {
             // Batch request: parse an array of requests
-            let parsed: Result<Vec<JsonRpcRequest<'_>>, _> =
-                serde_json::from_slice(&buffers.payload);
+            let parsed: Result<Vec<JsonRpcRequest<'_>>, _> = json_from_slice(&buffers.payload);
             match parsed {
                 Ok(reqs) if !reqs.is_empty() => {
-                    debug!(count = reqs.len(), bytes = buffers.payload.len(), "rpc batch received");
-                    let mut out: Vec<JsonRpcMessage<_>> = Vec::with_capacity(reqs.len());
-                    for JsonRpcRequest { id, method, params, .. } in reqs {
-                        let id = JsonRpcId::from_raw(id);
-                        let msg = match router.handle(method, params).await {
-                            Ok(result) => JsonRpcMessage::success(id.clone(), result),
-                            Err(err) => JsonRpcMessage::error(id, err),
-                        };
-                        out.push(msg);
+                    if log_sampled() {
+                        debug!(
+                            count = reqs.len(),
+                            bytes = buffers.payload.len(),
+                            "rpc batch received"
+                        );
                     }
-                    serde_json::to_writer(&mut buffers.response, &out)?;
+                    let out = handle_batch_requests(router, reqs).await?;
+                    json_to_writer(&mut buffers.response, &out)?;
                 }
                 Ok(_empty) => {
                     // Empty batch is an invalid request per JSON-RPC 2.0
                     let id = JsonRpcId::from_raw(None);
                     let resp: JsonRpcMessage<()> =
                         JsonRpcMessage::error(id, RpcCallError::invalid_request());
-                    serde_json::to_writer(&mut buffers.response, &resp)?;
+                    json_to_writer(&mut buffers.response, &resp)?;
                 }
                 Err(_) => {
                     // Try a best-effort generic parse to salvage
@@ -232,12 +234,10 @@ async fn handle_stream(
                                 let id = JsonRpcId::from_raw(None);
                                 let resp: JsonRpcMessage<()> =
                                     JsonRpcMessage::error(id, RpcCallError::invalid_request());
-                                serde_json::to_writer(&mut buffers.response, &resp)?;
+                                json_to_writer(&mut buffers.response, &resp)?;
                             } else {
-                                let method = val
-                                    .get("method")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("");
+                                let method =
+                                    val.get("method").and_then(|m| m.as_str()).unwrap_or("");
                                 let id = JsonRpcId::from_json_value(
                                     val.get("id").unwrap_or(&serde_json::Value::Null),
                                 );
@@ -245,7 +245,7 @@ async fn handle_stream(
                                     Ok(result) => JsonRpcMessage::success(id.clone(), result),
                                     Err(err) => JsonRpcMessage::error(id, err),
                                 };
-                                simd_json::to_writer(&mut buffers.response, &resp)?;
+                                json_to_writer(&mut buffers.response, &resp)?;
                             }
                         }
                         Err(_) => {
@@ -254,40 +254,42 @@ async fn handle_stream(
                             } else {
                                 let mut s =
                                     String::from_utf8_lossy(&buffers.payload[..256]).into_owned();
-                                s.push_str("…");
+                                s.push('…');
                                 s
                             };
-                            debug!(len = buffers.payload.len(), preview = %preview, "json parse failed");
+                            if log_sampled() {
+                                debug!(len = buffers.payload.len(), preview = %preview, "json parse failed");
+                            }
                             let id = JsonRpcId::from_raw(None);
                             let resp: JsonRpcMessage<()> =
                                 JsonRpcMessage::error(id, RpcCallError::invalid_request());
-                            serde_json::to_writer(&mut buffers.response, &resp)?;
+                            json_to_writer(&mut buffers.response, &resp)?;
                         }
                     }
                 }
             }
         } else {
             // Single-request path
-            let parsed: Result<JsonRpcRequest<'_>, _> =
-                serde_json::from_slice(&buffers.payload);
+            let parsed: Result<JsonRpcRequest<'_>, _> = json_from_slice(&buffers.payload);
             match parsed {
-                Ok(JsonRpcRequest { id, method, params, .. }) => {
-                    debug!(method = %method, bytes = buffers.payload.len(), "rpc request received");
+                Ok(JsonRpcRequest {
+                    id, method, params, ..
+                }) => {
+                    if log_sampled() {
+                        debug!(method = %method, bytes = buffers.payload.len(), "rpc request received");
+                    }
                     let id = JsonRpcId::from_raw(id);
                     let resp = match router.handle(method, params).await {
                         Ok(result) => JsonRpcMessage::success(id.clone(), result),
                         Err(err) => JsonRpcMessage::error(id, err),
                     };
-                    serde_json::to_writer(&mut buffers.response, &resp)?;
+                    json_to_writer(&mut buffers.response, &resp)?;
                 }
                 Err(_) => {
                     // Try a best-effort generic parse to salvage the request
                     match serde_json::from_slice::<serde_json::Value>(&buffers.payload) {
                         Ok(val) => {
-                            let method = val
-                                .get("method")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("");
+                            let method = val.get("method").and_then(|m| m.as_str()).unwrap_or("");
                             let id = JsonRpcId::from_json_value(
                                 val.get("id").unwrap_or(&serde_json::Value::Null),
                             );
@@ -295,7 +297,7 @@ async fn handle_stream(
                                 Ok(result) => JsonRpcMessage::success(id.clone(), result),
                                 Err(err) => JsonRpcMessage::error(id, err),
                             };
-                            serde_json::to_writer(&mut buffers.response, &resp)?;
+                            json_to_writer(&mut buffers.response, &resp)?;
                         }
                         Err(_) => {
                             let preview = if buffers.payload.len() <= 256 {
@@ -303,14 +305,16 @@ async fn handle_stream(
                             } else {
                                 let mut s =
                                     String::from_utf8_lossy(&buffers.payload[..256]).into_owned();
-                                s.push_str("…");
+                                s.push('…');
                                 s
                             };
-                            debug!(len = buffers.payload.len(), preview = %preview, "json parse failed");
+                            if log_sampled() {
+                                debug!(len = buffers.payload.len(), preview = %preview, "json parse failed");
+                            }
                             let id = JsonRpcId::from_raw(None);
                             let resp: JsonRpcMessage<()> =
                                 JsonRpcMessage::error(id, RpcCallError::invalid_request());
-                            serde_json::to_writer(&mut buffers.response, &resp)?;
+                            json_to_writer(&mut buffers.response, &resp)?;
                         }
                     }
                 }
@@ -330,7 +334,7 @@ async fn handle_stream(
     Ok(())
 }
 
-fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
+fn build_server_config(config: &UltraRpcConfig) -> Result<ServerConfig> {
     // Self-signed cert for embedded server (sufficient for QUIC RPC in trusted networks).
     let mut params = CertificateParams::new(vec![]);
     params.distinguished_name = DistinguishedName::new();
@@ -362,8 +366,20 @@ fn build_server_config(max_streams: u32) -> Result<ServerConfig> {
     let mut server_config =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
     let mut transport = TransportConfig::default();
-    transport.max_concurrent_bidi_streams(VarInt::from_u32(max_streams));
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(config.max_streams));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(3)));
+    // Apply flow-control windows
+    let stream_window = VarInt::try_from(config.quic_stream_recv_window)
+        .expect("validated stream window fits VarInt");
+    let conn_window = VarInt::try_from(config.quic_conn_recv_window)
+        .expect("validated connection window fits VarInt");
+    transport.stream_receive_window(stream_window);
+    transport.receive_window(conn_window);
+    if let Some(timeout) = config.quic_max_idle_timeout {
+        if let Ok(idle) = IdleTimeout::try_from(timeout) {
+            transport.max_idle_timeout(Some(idle));
+        }
+    }
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
 }
@@ -443,6 +459,116 @@ impl JsonRpcId {
             None => Self { raw: None },
         }
     }
+}
+
+// --- Platform-adaptive JSON helpers ---
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn json_from_slice<'a, T>(bytes: &'a [u8]) -> Result<T, simd_json::Error>
+where
+    T: serde::de::Deserialize<'a>,
+{
+    simd_json::from_slice(bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn json_from_slice<'a, T>(bytes: &'a [u8]) -> Result<T, serde_json::Error>
+where
+    T: serde::de::Deserialize<'a>,
+{
+    serde_json::from_slice(bytes)
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn json_to_writer<W, T>(mut writer: W, value: &T) -> Result<(), simd_json::Error>
+where
+    W: std::io::Write,
+    T: Serialize,
+{
+    simd_json::to_writer(&mut writer, value)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn json_to_writer<W, T>(mut writer: W, value: &T) -> Result<(), serde_json::Error>
+where
+    W: std::io::Write,
+    T: Serialize,
+{
+    serde_json::to_writer(&mut writer, value)
+}
+
+// --- Batch handling with order preservation (implementation added in next step) ---
+#[inline]
+async fn handle_one<'a>(
+    router: &'a RpcRouter,
+    i: usize,
+    id: JsonRpcId,
+    method: &'a str,
+    params: Option<&'a RawValue>,
+) -> (usize, JsonRpcId, Result<RpcResult, RpcCallError>) {
+    (i, id.clone(), router.handle(method, params).await)
+}
+
+#[inline]
+async fn handle_batch_requests(
+    router: &RpcRouter,
+    reqs: Vec<JsonRpcRequest<'_>>,
+) -> anyhow::Result<Vec<JsonRpcMessage<RpcResult>>> {
+    const BATCH_CONCURRENCY: usize = 32;
+    let mut out: Vec<Option<JsonRpcMessage<RpcResult>>> =
+        std::iter::repeat_with(|| None).take(reqs.len()).collect();
+    let mut iter = reqs.into_iter().enumerate();
+    let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+
+    for _ in 0..BATCH_CONCURRENCY {
+        if let Some((i, JsonRpcRequest { id, method, params, .. })) = iter.next() {
+            let id = JsonRpcId::from_raw(id);
+            let fut = handle_one(router, i, id.clone(), method, params);
+            futs.push(fut);
+        } else {
+            break;
+        }
+    }
+
+    while let Some((i, id, res)) = futs.next().await {
+        let msg = match res {
+            Ok(result) => JsonRpcMessage::success(id.clone(), result),
+            Err(err) => JsonRpcMessage::error(id, err),
+        };
+        out[i] = Some(msg);
+        if let Some((j, JsonRpcRequest { id, method, params, .. })) = iter.next() {
+            let id2 = JsonRpcId::from_raw(id);
+            let fut = handle_one(router, j, id2.clone(), method, params);
+            futs.push(fut);
+        }
+    }
+
+    // Safety: all slots should be filled; fall back to filtering None if needed.
+    let result: Vec<JsonRpcMessage<RpcResult>> = out.into_iter().flatten().collect();
+    Ok(result)
+}
+
+// --- Log sampling ---
+static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
+static LOG_SAMPLE_RATE: Lazy<u64> = Lazy::new(|| {
+    std::env::var("ULTRA_RPC_LOG_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+});
+
+#[inline]
+fn log_sampled() -> bool {
+    let rate = *LOG_SAMPLE_RATE;
+    if rate == 0 {
+        return false;
+    }
+    let seq = LOG_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+    (seq % rate) == 0
 }
 
 impl Serialize for JsonRpcId {

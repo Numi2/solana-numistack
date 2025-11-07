@@ -2,7 +2,7 @@
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Lock-free single-producer single-consumer ring buffer.
@@ -95,10 +95,11 @@ impl<T> Inner<T> {
             match self.tail.compare_exchange(
                 tail,
                 tail.wrapping_add(1),
-                Ordering::AcqRel,
+                Ordering::Release,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    fence(Ordering::Acquire);
                     unsafe {
                         (*self.buffer[idx].get()).assume_init_drop();
                     }

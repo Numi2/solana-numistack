@@ -1,0 +1,66 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "gnetId": null,
+  "iteration": 1,
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Ingest decode p99 / p99.9 (us)",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(ultra_ingest_delta_decode_us_bucket[5m])) by (le))", "legendFormat": "delta p99" },
+        { "expr": "histogram_quantile(0.999, sum(rate(ultra_ingest_delta_decode_us_bucket[5m])) by (le))", "legendFormat": "delta p99.9" },
+        { "expr": "histogram_quantile(0.99, sum(rate(ultra_ingest_snapshot_decode_us_bucket[5m])) by (le))", "legendFormat": "snapshot p99" },
+        { "expr": "histogram_quantile(0.999, sum(rate(ultra_ingest_snapshot_decode_us_bucket[5m])) by (le))", "legendFormat": "snapshot p99.9" }
+      ],
+      "lines": true,
+      "datasource": "Prometheus"
+    },
+    {
+      "type": "graph",
+      "title": "Aggregation publish latency p99 / p99.9 (ms)",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(ultra_ingest_publish_ms_bucket[5m])) by (le))", "legendFormat": "publish p99" },
+        { "expr": "histogram_quantile(0.999, sum(rate(ultra_ingest_publish_ms_bucket[5m])) by (le))", "legendFormat": "publish p99.9" }
+      ],
+      "lines": true,
+      "datasource": "Prometheus"
+    },
+    {
+      "type": "graph",
+      "title": "Writer block and batch time (us/ms)",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(ultra_write_block_us_bucket[5m])) by (le))", "legendFormat": "writer block p99 (us)" },
+        { "expr": "histogram_quantile(0.99, sum(rate(ultra_batch_ms_bucket[5m])) by (le))", "legendFormat": "batch p99 (ms)" }
+      ],
+      "datasource": "Prometheus"
+    },
+    {
+      "type": "graph",
+      "title": "Queue depths",
+      "targets": [
+        { "expr": "ultra_queue_len", "legendFormat": "writer shard queue" }
+      ],
+      "datasource": "Prometheus"
+    },
+    {
+      "type": "graph",
+      "title": "RPC batch latency p99 / p99.9 (ms)",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(ultra_batch_ms_bucket[5m])) by (le))", "legendFormat": "rpc batch p99" },
+        { "expr": "histogram_quantile(0.999, sum(rate(ultra_batch_ms_bucket[5m])) by (le))", "legendFormat": "rpc batch p99.9" }
+      ],
+      "datasource": "Prometheus"
+    }
+  ],
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["ultra", "rpc"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "title": "Ultra RPC SLOs",
+  "version": 1
+}
+
+
